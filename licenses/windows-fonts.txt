@@ -1,0 +1,7 @@
+StraviaIris Windows 字体说明
+
+SDK 使用运行主机上合法安装的 Windows 字体，不复制或分发 profiles/windows-desktop.json 所列的宿主字体文件。运行前会检查该固定集合；缺失时返回 ProfileUnavailable，不下载字体或改用隐藏的替代集合。
+
+Microsoft 字体的安装、使用和再分发权利取决于适用的 Windows 或字体许可。本 SDK 的源码许可不授予 Microsoft 字体再分发权利。
+
+演示中的 Ahem.ttf 是独立的网页字体测试资源，不是宿主字体。其来源与许可见 examples/iris-demo/fixtures/Ahem.LICENSE.txt。CEF 自带资源及第三方声明保留在 licenses/cef/ 中。

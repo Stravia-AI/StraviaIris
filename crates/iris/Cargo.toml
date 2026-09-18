@@ -1,0 +1,17 @@
+# iris:StraviaIris 原生共享 SDK 的 Rust safe facade。
+#
+# 面向业务代码的唯一入口:无 handwritten unsafe、无裸 CEF 类型、
+# 无 sandbox/version 指针;unsafe 仅存在于私有 trampoline。
+# 运行时依赖仅 serde_json 1.x(与 native payload 同构),并被
+# Cargo.lock 锁定。
+[package]
+name = "iris"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "StraviaIris safe Rust SDK facade over the native shared library"
+
+[dependencies]
+iris-sys = { path = "../iris-sys" }
+serde_json.workspace = true

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>iframe 测量点</title>
+<style>
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; margin: 6px;
+         color: #333; }
+  code { font-size: 11px; word-break: break-all; }
+</style>
+</head>
+<body>
+<strong id="label">iframe 测量点</strong>
+<p>本帧独立采样 Navigator / UAData 高熵 / 时区 / 屏幕 / matchMedia 后，经 postMessage 上报父页；
+父页校验 source / origin / token 三要素。API 名保持英文。</p>
+<script>
+/* 每个 iframe 在首脚本采样身份，在首个动画帧采样已布局的屏幕与视口。
+   token 由父页通过 URL fragment 传入，不出现在
+   请求日志中；postMessage 目标 origin 依据 document.referrer（跨源时默认策略只发送
+   origin）。getHighEntropyValues 为本地计算，随首个报告一并返回。 */
+(function () {
+  'use strict';
+  var HIGH_ENTROPY = ['architecture', 'bitness', 'model', 'platformVersion',
+                      'uaFullVersion', 'fullVersionList', 'wow64'];
+  function timezoneSample() {
+    var winter = new Date('2026-01-15T12:00:00Z');
+    var summer = new Date('2026-07-15T12:00:00Z');
+    var fmt = null;
+    try { fmt = new Intl.DateTimeFormat('en-US', { timeZoneName: 'longOffset' }); } catch (e) {}
+    var resolved = null;
+    try { resolved = fmt && fmt.resolvedOptions().timeZone; } catch (e) {}
+    return {
+      offsetWinterMinutes: winter.getTimezoneOffset(),
+      offsetSummerMinutes: summer.getTimezoneOffset(),
+      resolvedTimeZone: resolved === undefined ? null : resolved,
+      formattedWinter: fmt ? fmt.format(winter) : null,
+      formattedSummer: fmt ? fmt.format(summer) : null,
+      localString: winter.toString()
+    };
+  }
+  function coreSample() {
+    var n = navigator;
+    return {
+      userAgent: typeof n.userAgent === 'string' ? n.userAgent : null,
+      appVersion: typeof n.appVersion === 'string' ? n.appVersion : null,
+      platform: typeof n.platform === 'string' ? n.platform : null,
+      language: typeof n.language === 'string' ? n.language : null,
+      languages: Array.isArray(n.languages) ? Array.from(n.languages) : null,
+      hardwareConcurrency: typeof n.hardwareConcurrency === 'number' ? n.hardwareConcurrency : null,
+      deviceMemory: typeof n.deviceMemory === 'number' ? n.deviceMemory : null,
+      maxTouchPoints: typeof n.maxTouchPoints === 'number' ? n.maxTouchPoints : null,
+      webdriver: {
+        typeofValue: typeof n.webdriver,
+        value: n.webdriver === undefined ? null : n.webdriver,
+        present: 'webdriver' in n
+      },
+      userAgentData: n.userAgentData ? {
+        brands: n.userAgentData.brands.map(function (b) { return [b.brand, b.version]; }),
+        mobile: n.userAgentData.mobile,
+        platform: n.userAgentData.platform
+      } : null
+    };
+  }
+  function screenSample() {
+    var s = screen, so = s.orientation;
+    var dpr = window.devicePixelRatio;
+    var queries = {};
+    try { queries.orientation = matchMedia('(orientation: landscape)').matches; } catch (e) { queries.orientation = null; }
+    try {
+      var rounded = Math.round(dpr * 8) / 8;
+      var q = matchMedia('(resolution: ' + rounded + 'dppx)');
+      queries.resolution = { query: '(resolution: ' + rounded + 'dppx)', matches: q.matches };
+    } catch (e) { queries.resolution = null; }
+    try { queries.colorGamutP3 = matchMedia('(color-gamut: p3)').matches; } catch (e) { queries.colorGamutP3 = null; }
+    try { queries.prefersColorScheme = matchMedia('(prefers-color-scheme: dark)').matches; } catch (e) { queries.prefersColorScheme = null; }
+    return {
+      width: s.width, height: s.height,
+      availWidth: s.availWidth, availHeight: s.availHeight,
+      availLeft: s.availLeft, availTop: s.availTop,
+      colorDepth: s.colorDepth, pixelDepth: s.pixelDepth,
+      isExtended: s.isExtended === undefined ? null : s.isExtended,
+      devicePixelRatio: dpr,
+      orientation: so ? { type: so.type, angle: so.angle } : null,
+      viewport: { innerWidth: innerWidth, innerHeight: innerHeight },
+      matchMedia: queries
+    };
+  }
+  function parentOriginOf() {
+    try {
+      return document.referrer ? new URL(document.referrer).origin : location.origin;
+    } catch (e) { return location.origin; }
+  }
+
+  var params = {};
+  try { params = new URLSearchParams(location.search); } catch (e) {}
+  var kind = params.get('iris');
+  var tokenMatch = location.hash.match(/[#&]t=([0-9a-f]+)/);
+  var token = tokenMatch ? tokenMatch[1] : null;
+  var initialSample = coreSample();
+  initialSample.timezone = timezoneSample();
+
+  var highEntropy = { supported: false, error: null, values: null };
+  var highPromise;
+  try {
+    highPromise = navigator.userAgentData
+      ? navigator.userAgentData.getHighEntropyValues(HIGH_ENTROPY)
+      : Promise.resolve(null);
+  } catch (e) { highPromise = Promise.reject(e); }
+
+  function deliver() {
+    var parentOrigin = parentOriginOf();
+    var sample = initialSample;
+    sample.highEntropy = highEntropy;
+    sample.screen = screenSample();
+    sample.frame = {
+      kind: kind, href: location.href, origin: location.origin,
+      isTop: window.top === window.self,
+      referrerOrigin: document.referrer ? new URL(document.referrer).origin : null,
+      tokenInFragment: !!token
+    };
+    var payload = { iris: 'iris-context-report', kind: kind, token: token,
+                    origin: location.origin, sample: sample };
+    try {
+      parent.postMessage(payload, parentOrigin);
+    } catch (e) {
+      /* 目标 origin 无效时才降级为通配；记录降级事实，不静默。 */
+      payload.wildcardTargetOrigin = true;
+      payload.wildcardError = String(e && e.message || e);
+      parent.postMessage(payload, '*');
+    }
+    var label = document.getElementById('label');
+    if (label) label.textContent =
+      (kind === 'cross' ? '跨站 iframe（localhost）' : '同源 iframe') + ' 测量点 — 已上报';
+  }
+
+  withTimeout(highPromise, 5000).then(function (high) {
+    if (navigator.userAgentData) {
+      highEntropy = { supported: true, error: null,
+                      values: high ? JSON.parse(JSON.stringify(high)) : null };
+    } else {
+      highEntropy = { supported: false, error: 'userAgentData 不存在', values: null };
+    }
+    requestAnimationFrame(deliver);
+  }, function (err) {
+    highEntropy = { supported: navigator.userAgentData ? true : false,
+                    error: String(err && err.message || err), values: null };
+    requestAnimationFrame(deliver);
+  });
+
+  function withTimeout(promise, ms) {
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () { reject(new Error('timeout:context-highentropy:' + ms + 'ms')); }, ms);
+      Promise.resolve(promise).then(function (v) { clearTimeout(timer); resolve(v); },
+                                    function (e) { clearTimeout(timer); reject(e); });
+    });
+  }
+})();
+</script>
+</body>
+</html>

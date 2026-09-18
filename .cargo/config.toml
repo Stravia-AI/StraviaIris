@@ -1,0 +1,12 @@
+# 工作区统一构建配置。
+#
+# 目标固定为 Windows x64 MSVC,与计划及 iris-sdk.json 的 target 字段一致。
+# 静态 CRT(+crt-static,链接 libcmt)与 SDK DLL(/MT 构建的
+# stravia_iris.dll,CEF 分发仅支持 /MT)保持一致;混用动态 CRT 禁止。
+# /DELAYLOAD 等 manifest 派生的链接要求由最终客户端 build.rs
+# 复用 crates/iris-sys/sdk_link.rs 校验后输出，不在此硬编码。
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

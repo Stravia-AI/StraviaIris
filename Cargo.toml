@@ -1,0 +1,13 @@
+# StraviaIris SDK 与演示模块工作区。
+[workspace]
+resolver = "3"
+members = ["crates/iris-sys", "crates/iris", "examples/iris-demo", "examples/iris-lifecycle"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# 锁定 1.x:facade 与业务 JSON 使用同一版本,Cargo.lock 固化具体版本与校验和。
+serde_json = "1"

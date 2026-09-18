@@ -1,0 +1,16 @@
+# StraviaIris 包版本与兼容性检查。
+set(PACKAGE_VERSION "@IRIS_ENGINE_BUILD_ID@")
+
+# 仅在 Windows x64 + MSVC 上兼容。
+if(NOT WIN32)
+  set(PACKAGE_VERSION_UNSUITABLE TRUE)
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(PACKAGE_VERSION_UNSUITABLE TRUE)
+endif()
+if(NOT MSVC)
+  set(PACKAGE_VERSION_UNSUITABLE TRUE)
+endif()
+
+# 版本号即引擎 build ID：与 SDK 编译期绑定的引擎一一对应。
+set(PACKAGE_VERSION_EXACT FALSE)

@@ -1,0 +1,7 @@
+{
+  "name": "stravia-iris-acceptance",
+  "private": true,
+  "type": "module",
+  "scripts": { "cdp-smoke": "node examples/cdp-smoke.mjs" },
+  "devDependencies": { "playwright": "1.63.0", "puppeteer-core": "25.11.0" }
+}

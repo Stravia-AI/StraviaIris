@@ -1,0 +1,825 @@
+目的：导出真实引擎构建标识和 DevTools bind 结果；浏览器 UI 线程交付原始错误，只绑定 127.0.0.1 指定端口，不换端口或地址重试。
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：原版/错误引擎拒绝、调试禁用与精确端口 bind、占用端口真实失败、外部 CDP 接入及注销后生命周期。
+
+diff --git cef/BUILD.gn cef/BUILD.gn
+index a8c7c0781e550fb9605427757dc84d61a5ca05be..9452a4779e636408444d671d81c566d7a5ff56fb 100644
+--- cef/BUILD.gn
++++ cef/BUILD.gn
+@@ -845,6 +845,8 @@ source_set("libcef_static") {
+     "libcef/common/frame_util.cc",
+     "libcef/common/frame_util.h",
+     "libcef/common/i18n_util_impl.cc",
++    "libcef/common/iris_engine_exports.cc",
++    "libcef/common/iris_engine_exports.h",
+     "libcef/common/json_impl.cc",
+     "libcef/common/net/http_header_utils.cc",
+     "libcef/common/net/http_header_utils.h",
+diff --git cef/DEPS cef/DEPS
+index 0a7dc22e3e067524242172adbd5e3d26086fa00d..2db0c12619f8aa687403e00d67674b5c69189166 100644
+--- cef/DEPS
++++ cef/DEPS
+@@ -5,3 +5,21 @@ hooks = [
+     "action": ["python", "src/cef/tools/gclient_hook.py"],
+   },
+ ]
++
++specific_include_rules = {
++  "chrome_main_delegate_cef\\.cc": [
++    "+components/iris",
++    "+ui/display/display_switches.h",
++    "+ui/gfx/win/direct_write.h",
++  ],
++  "chrome_content_browser_client_cef\\.cc": [
++    "+components/iris",
++  ],
++  "iris_engine_exports\\.cc": [
++    "+components/iris/engine_build_id.h",
++    "+content/public/browser/devtools_server_start_observer.h",
++  ],
++  "iris_engine_exports\\.h": [
++    "+include/internal/cef_export.h",
++  ],
++}
+diff --git cef/docs/general_usage.md cef/docs/general_usage.md
+index 68bc05d04ffeb6d4828babd9ebc0c017394f6d7c..083a0e3dcf0db772621b7b5ec758e36a3fdef41d 100644
+--- cef/docs/general_usage.md
++++ cef/docs/general_usage.md
+@@ -541,7 +541,7 @@ The CefSettings structure allows configuration of application-wide CEF settings.
+   * **log\_severity** The log severity. Only messages of this severity level or higher will be logged. Also configurable using the "log-severity" command-line switch with a value of "verbose", "info", "warning", "error", "error-report" or "disable".
+   * **resources\_dir\_path** The fully qualified path for the resources directory. If this value is empty the cef.pak and/or devtools\_resources.pak files must be located in the module directory on Windows/Linux or the app bundle Resources directory on MacOS. Also configurable using the "resources-dir-path" command-line switch.
+   * **locales\_dir\_path** The fully qualified path for the locales directory. If this value is empty the locales directory must be located in the module directory. This value is ignored on MacOS where pack files are always loaded from the app bundle Resources directory. Also configurable using the "locales-dir-path" command-line switch.
+-  * **remote\_debugging\_port** Set to a value between 1024 and 65535 to enable remote debugging on the specified port. For example, if 8080 is specified the remote debugging URL will be http://localhost:8080. CEF can be remotely debugged from any CEF or Chrome browser window. Also configurable using the "remote-debugging-port" command-line switch.
++  * **remote\_debugging\_port** Set to a value between 1 and 65535 to enable remote debugging on the specified port (0 disables it). For example, if 8080 is specified the remote debugging URL will be http://localhost:8080. The server binds to loopback addresses only and fails without port fallback if the port cannot be bound. CEF can be remotely debugged from any CEF or Chrome browser window. Also configurable using the "remote-debugging-port" command-line switch.
+ 
+ ## CefBrowser and CefFrame
+ 
+diff --git cef/include/internal/cef_types.h cef/include/internal/cef_types.h
+index a22cedeb8ad2c67dacbec35b4e6104c37ac02dd5..0d21f7f9355d1903c62442c47b66839d0dd8d032 100644
+--- cef/include/internal/cef_types.h
++++ cef/include/internal/cef_types.h
+@@ -413,9 +413,13 @@ typedef struct _cef_settings_t {
+   cef_string_t locales_dir_path;
+ 
+   ///
+-  /// Set to a value between 1024 and 65535 to enable remote debugging on the
+-  /// specified port. Also configurable using the "remote-debugging-port"
+-  /// command-line switch. Specifying 0 via the command-line switch will result
++  /// Set to a value between 1 and 65535 to enable remote debugging on the
++  /// specified port. A value of 0 (the default value) disables remote
++  /// debugging. The server binds to loopback addresses only. If the
++  /// specified port cannot be bound the start attempt fails without
++  /// falling back to a different port. Also configurable using the
++  /// "remote-debugging-port" command-line switch. Specifying 0 via the
++  /// command-line switch will result
+   /// in the selection of an ephemeral port and the port number will be printed
+   /// as part of the WebSocket endpoint URL to stderr. If a cache directory path
+   /// is provided the port will also be written to the
+diff --git cef/libcef/common/iris_engine_exports.cc cef/libcef/common/iris_engine_exports.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..3cfc1cfb9958ac2b240506206c910853f4b71389
+--- /dev/null
++++ cef/libcef/common/iris_engine_exports.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "cef/libcef/common/iris_engine_exports.h"
++
++#include "base/functional/bind.h"
++#include "base/notreached.h"
++#include "components/iris/engine_build_id.h"
++#include "content/public/browser/devtools_server_start_observer.h"
++
++namespace {
++int32_t MapStartStatus(const content::DevToolsServerStartResult& result) {
++  if (result.started) {
++    return result.endpoint.address().IsLoopback()
++               ? iris_engine_debug_status_listening
++               : iris_engine_debug_status_endpoint_unverified;
++  }
++  switch (result.reason) {
++    case content::DevToolsServerStartResult::Reason::kSocketFailed:
++      return iris_engine_debug_status_bind_failed;
++    case content::DevToolsServerStartResult::Reason::kDisallowed:
++      return iris_engine_debug_status_disallowed;
++    case content::DevToolsServerStartResult::Reason::kServerThreadFailed:
++      return iris_engine_debug_status_server_thread_failed;
++  }
++  NOTREACHED();
++}
++}  // namespace
++
++const char* iris_engine_build_id(void) {
++  return iris::profile::kEngineBuildId;
++}
++
++void iris_engine_set_debugging_callback(
++    iris_engine_debugging_callback_t callback,
++    void* user_data) {
++  if (!callback) {
++    content::SetDevToolsServerStartObserver({});
++    return;
++  }
++  content::SetDevToolsServerStartObserver(base::BindRepeating(
++      [](iris_engine_debugging_callback_t notify, void* data,
++         const content::DevToolsServerStartResult& result) {
++        notify(MapStartStatus(result), result.net_error, result.endpoint.port(), data);
++      }, callback, user_data));
++}
+diff --git cef/libcef/common/iris_engine_exports.h cef/libcef/common/iris_engine_exports.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6290e00014785518483482f060cc74b808372f8
+--- /dev/null
++++ cef/libcef/common/iris_engine_exports.h
+@@ -0,0 +1,84 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// StraviaIris 私有引擎协议导出。本文件不属于 CEF 公共 API：CEF API hash、
++// 既有公共函数签名与导出集保持不变。字段与 ABI 严格对齐 SDK 侧
++// native/src/engine_protocol.h（iris_engine 命名空间中的函数指针类型）：
++//
++//   using BuildIdFunction = const char*(__cdecl*)();
++//   using DebuggingCallback = void(__cdecl*)(int32_t status,
++//                                            int32_t native_error,
++//                                            uint32_t port,
++//                                            void* user_data);
++//   using SetDebuggingCallbackFunction = void(__cdecl*)(DebuggingCallback,
++//                                                       void* user_data);
++//
++// iris_engine_build_id() 返回 components/iris/engine_build_id.h 中
++// iris::profile::kEngineBuildId（由构建从锁定源码+补丁队列+profile 生成，
++// 64 位小写十六进制 SHA-256，NUL 结尾，静态存储期）。SDK 用它在
++// CefInitialize 之前拒绝相同版本的原版 libcef。
++//
++// iris_engine_set_debugging_callback() 在 CefInitialize 之前注册、在
++// CefShutdown 之前注销（传空 callback 即注销）。回调在浏览器 UI 线程交付
++// 真实 DevTools HTTP 服务的启动结果，结果来自实际 socket owner（绑定/
++// 监听线程完成后的上报），不经日志、端口探测或初始化成功推断。
++
++#ifndef CEF_LIBCEF_COMMON_IRIS_ENGINE_EXPORTS_H_
++#define CEF_LIBCEF_COMMON_IRIS_ENGINE_EXPORTS_H_
++
++#include <stdint.h>
++
++#include "include/internal/cef_export.h"
++
++#if defined(COMPILER_MSVC)
++#define IRIS_ENGINE_CDECL __cdecl
++#else
++#define IRIS_ENGINE_CDECL
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// 调试端点回调。status 取下方 iris_engine_debug_status_* 之一：
++//   0 = 绑定成功且仅监听 loopback；port 为实际监听端口；
++//   非 0 = 失败，native_error 保留原始错误（负值 net::Error；无原始
++//   错误时为 0），port 为已知实际端口（未知为 0）。
++// 回调在 UI 线程同步调用，必须快速返回，且不得重入
++// iris_engine_set_debugging_callback。
++typedef void(IRIS_ENGINE_CDECL* iris_engine_debugging_callback_t)(
++    int32_t status,
++    int32_t native_error,
++    uint32_t port,
++    void* user_data);
++
++// 启动结果状态码。0 之外均为失败；SDK 契约只依赖 0/非 0。
++enum {
++  // 成功：HTTP 服务正在监听，且绑定端点已确认仅 loopback。
++  iris_engine_debug_status_listening = 0,
++  // 绑定失败：socket 创建/listen 失败；native_error 为原始 net::Error。
++  iris_engine_debug_status_bind_failed = 1,
++  // 在任何绑定尝试之前被策略/偏好拒绝；native_error 为 0。
++  iris_engine_debug_status_disallowed = 2,
++  // DevTools 服务线程未能启动，未发生绑定；native_error 为 0。
++  iris_engine_debug_status_server_thread_failed = 3,
++  // 正在监听但绑定端点未知或非 loopback，无法确认仅 loopback 监听；
++  // native_error 为读取本地地址失败时的原始 net::Error，否则为 0。
++  iris_engine_debug_status_endpoint_unverified = 4,
++};
++
++// 返回引擎 build ID（静态存储期的 NUL 结尾字符串）。
++CEF_EXPORT const char* iris_engine_build_id(void);
++
++// 注册/注销调试端点结果回调。user_data 原样透传。重复注册替换前一次
++// 注册；必须在 CefInitialize 前注册，UI 线程建立后只允许在该线程
++// 注册/注销。传空 callback 注销，返回后不会再访问旧 userdata。
++CEF_EXPORT void iris_engine_set_debugging_callback(
++    iris_engine_debugging_callback_t callback,
++    void* user_data);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // CEF_LIBCEF_COMMON_IRIS_ENGINE_EXPORTS_H_
+diff --git chrome/browser/android/devtools_server.cc chrome/browser/android/devtools_server.cc
+index 0f76edb356b6d82cce2e660a58bf2bbc159a3169..908a1280f68fc678255864452d02502ef47be895 100644
+--- chrome/browser/android/devtools_server.cc
++++ chrome/browser/android/devtools_server.cc
+@@ -87,18 +87,21 @@ class UnixDomainServerSocketFactory : public content::DevToolsSocketFactory {
+       const UnixDomainServerSocketFactory&) = delete;
+ 
+  private:
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     std::unique_ptr<net::UnixDomainServerSocket> socket(
+         new net::UnixDomainServerSocket(auth_callback_,
+                                         true /* use_abstract_namespace */));
+ 
+-    if (socket->BindAndListen(socket_name_, kBackLog) == net::OK)
++    *net_error = socket->BindAndListen(socket_name_, kBackLog);
++    if (*net_error == net::OK)
+       return std::move(socket);
+ 
+     // Try a fallback socket name.
+     const std::string fallback_address(
+         base::StringPrintf("%s_%d", socket_name_.c_str(), getpid()));
+-    if (socket->BindAndListen(fallback_address, kBackLog) == net::OK)
++    *net_error = socket->BindAndListen(fallback_address, kBackLog);
++    if (*net_error == net::OK)
+       return std::move(socket);
+ 
+     return nullptr;
+diff --git chrome/browser/devtools/remote_debugging_server.cc chrome/browser/devtools/remote_debugging_server.cc
+index ea5ffb9a23e5167481817e7f9966ba84504e50fa..94272d9369169231c644ce4adfb4d2ddca72eaba 100644
+--- chrome/browser/devtools/remote_debugging_server.cc
++++ chrome/browser/devtools/remote_debugging_server.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_service.h"
++#include "content/public/browser/devtools_server_start_observer.h"
+ #include "content/public/browser/devtools_agent_host.h"
+ #include "content/public/browser/devtools_socket_factory.h"
+ #include "content/public/common/content_constants.h"
+@@ -78,20 +79,24 @@ class TCPServerSocketFactory
+ 
+  protected:
+   // content::DevToolsSocketFactory.
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
+-    return CreateLocalHostServerSocket(port_);
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
++    return CreateLocalHostServerSocket(port_, net_error);
+   }
+   uint16_t port_;
+ 
+  private:
+-  std::unique_ptr<net::ServerSocket> CreateLocalHostServerSocket(int port) {
++  std::unique_ptr<net::ServerSocket> CreateLocalHostServerSocket(int port,
++                                                                 int* net_error) {
+     std::unique_ptr<net::ServerSocket> socket(
+         new net::TCPServerSocket(nullptr, net::NetLogSource()));
+-    if (socket->ListenWithAddressAndPort(
+-            "127.0.0.1", port, kBackLog) == net::OK)
+-      return socket;
+-    if (socket->ListenWithAddressAndPort("::1", port, kBackLog) == net::OK)
++    int result = socket->ListenWithAddressAndPort("127.0.0.1", port,
++                                                  kBackLog);
++    if (result == net::OK) {
++      *net_error = net::OK;
+       return socket;
++    }
++    *net_error = result;
+     return nullptr;
+   }
+ 
+@@ -105,7 +110,8 @@ class TCPServerSocketFactory
+       last_tethering_port_ = kMinTetheringPort;
+     uint16_t port = ++last_tethering_port_;
+     *name = base::NumberToString(port);
+-    return CreateLocalHostServerSocket(port);
++    int net_error = net::OK;
++    return CreateLocalHostServerSocket(port, &net_error);
+   }
+ 
+   uint16_t last_tethering_port_;
+@@ -119,37 +125,41 @@ class TCPServerSocketFactoryWithPortFallback : public TCPServerSocketFactory {
+ 
+  private:
+   std::unique_ptr<net::ServerSocket> CreateSocketOnAddress(const char* address,
+-                                                           uint16_t port) {
++                                                           uint16_t port,
++                                                           int* net_error) {
+     auto socket =
+         std::make_unique<net::TCPServerSocket>(nullptr, net::NetLogSource());
+-    if (socket->ListenWithAddressAndPort(address, port, kBackLog) == net::OK) {
++    *net_error =
++        socket->ListenWithAddressAndPort(address, port, kBackLog);
++    if (*net_error == net::OK) {
+       return socket;
+     }
+     return nullptr;
+   }
+ 
+   // content::DevToolsSocketFactory.
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     std::unique_ptr<net::ServerSocket> socket =
+-        CreateSocketOnAddress("127.0.0.1", port_);
++        CreateSocketOnAddress("127.0.0.1", port_, net_error);
+     if (socket) {
+       return socket;
+     }
+ 
+     if (port_ != 0) {
+-      socket = CreateSocketOnAddress("127.0.0.1", 0);
++      socket = CreateSocketOnAddress("127.0.0.1", 0, net_error);
+       if (socket) {
+         return socket;
+       }
+     }
+ 
+-    socket = CreateSocketOnAddress("::1", port_);
++    socket = CreateSocketOnAddress("::1", port_, net_error);
+     if (socket) {
+       return socket;
+     }
+ 
+     if (port_ != 0) {
+-      socket = CreateSocketOnAddress("::1", 0);
++      socket = CreateSocketOnAddress("::1", 0, net_error);
+       if (socket) {
+         return socket;
+       }
+@@ -190,6 +200,16 @@ bool isRemoteDebuggingEnabledViaPrefs(PrefService* local_state) {
+   return local_state->GetBoolean(prefs::kDevToolsRemoteDebuggingEnabled);
+ }
+ 
++// Reports a start request that was rejected before any socket was created,
++// so registered observers see a terminal outcome instead of waiting for a
++// server start result that will never arrive. Called on the UI thread.
++void NotifyStartDisallowed() {
++  content::DevToolsServerStartResult result;
++  result.started = false;
++  result.reason = content::DevToolsServerStartResult::Reason::kDisallowed;
++  content::NotifyDevToolsServerStarted(result);
++}
++
+ }  // namespace
+ 
+ int RemoteDebuggingServer::GetPortFromUserDataDir(
+@@ -337,6 +357,7 @@ base::expected<std::unique_ptr<RemoteDebuggingServer>,
+                RemoteDebuggingServer::NotStartedReason>
+ RemoteDebuggingServer::GetInstance(PrefService* local_state) {
+   if (!local_state->GetBoolean(prefs::kDevToolsRemoteDebuggingAllowed)) {
++    NotifyStartDisallowed();
+     return base::unexpected(NotStartedReason::kDisabledByPolicy);
+   }
+ 
+@@ -355,6 +376,7 @@ RemoteDebuggingServer::GetInstance(PrefService* local_state) {
+     if (const auto maybe_allow_debugging =
+             IsRemoteDebuggingAllowed(is_default_user_data_dir, local_state);
+         !maybe_allow_debugging.has_value()) {
++      NotifyStartDisallowed();
+       return base::unexpected(maybe_allow_debugging.error());
+     }
+     debugging_server_started = true;
+@@ -385,6 +407,7 @@ RemoteDebuggingServer::GetInstance(PrefService* local_state) {
+     if (const auto maybe_allow_debugging =
+             IsRemoteDebuggingAllowed(is_default_user_data_dir, local_state);
+         !maybe_allow_debugging.has_value()) {
++      NotifyStartDisallowed();
+       return base::unexpected(maybe_allow_debugging.error());
+     }
+ 
+@@ -405,6 +428,7 @@ RemoteDebuggingServer::GetInstance(PrefService* local_state) {
+     // the user (allow/disallow actions are tracked via the
+     // DevToolsRemoteDebuggingConnectionPermission histogram).
+     if (!local_state->GetBoolean(prefs::kDevToolsRemoteDebuggingAllowed)) {
++      NotifyStartDisallowed();
+       return base::unexpected(
+           RemoteDebuggingServer::NotStartedReason::kDisabledByPolicy);
+     }
+diff --git content/browser/BUILD.gn content/browser/BUILD.gn
+index cea9156a5cff4ce76bffadf8a2a9124c7fac9297..766ff6e69bf85c705cd691f5249883f9a20dba99 100644
+--- content/browser/BUILD.gn
++++ content/browser/BUILD.gn
+@@ -822,6 +822,7 @@ source_set("browser") {
+     "devtools/devtools_device_request_prompt_info.h",
+     "devtools/devtools_http_handler.cc",
+     "devtools/devtools_http_handler.h",
++    "devtools/devtools_server_start_observer.cc",
+     "devtools/devtools_instrumentation.cc",
+     "devtools/devtools_instrumentation.h",
+     "devtools/devtools_io_context.cc",
+diff --git content/browser/devtools/devtools_http_handler.cc content/browser/devtools/devtools_http_handler.cc
+index ea7f1ed74250198d4be2a16474e167b74763c089..db33588795245bee3ff6c27b90e428580dea549f 100644
+--- content/browser/devtools/devtools_http_handler.cc
++++ content/browser/devtools/devtools_http_handler.cc
+@@ -37,6 +37,7 @@
+ #include "build/build_config.h"
+ #include "build/util/chromium_git_revision.h"
+ #include "content/browser/devtools/devtools_manager.h"
++#include "content/public/browser/devtools_server_start_observer.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -250,17 +251,39 @@ void ServerStartedOnUI(base::WeakPtr<DevToolsHttpHandler> handler,
+                        std::unique_ptr<base::Thread> thread,
+                        ServerWrapper* server_wrapper,
+                        DevToolsSocketFactory* socket_factory,
+-                       std::unique_ptr<net::IPEndPoint> ip_address) {
++                       std::unique_ptr<net::IPEndPoint> ip_address,
++                       int net_error) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+   if (handler && thread && server_wrapper) {
++    // Report the real outcome from the socket owner: the server thread has
++    // completed its bind/listen attempt. |ip_address| is null when the
++    // socket is listening but its local address could not be read; report
++    // that as started with an empty endpoint (and the preserved lookup
++    // error) so consumers can distinguish it from a confirmed bind
++    // address.
++    content::DevToolsServerStartResult result;
++    result.started = true;
++    result.net_error = net_error;
++    if (ip_address) {
++      result.endpoint = *ip_address;
++    }
+     handler->ServerStarted(
+         std::move(thread), std::unique_ptr<ServerWrapper>(server_wrapper),
+         std::unique_ptr<DevToolsSocketFactory>(socket_factory),
+         std::move(ip_address));
++    NotifyDevToolsServerStarted(result);
+   } else {
+     TerminateOnUI(std::move(thread),
+                   std::unique_ptr<ServerWrapper>(server_wrapper),
+                   std::unique_ptr<DevToolsSocketFactory>(socket_factory));
++    // The start attempt failed on the server thread (no socket, or the
++    // handler was destroyed before the result arrived). Preserve the
++    // original net error from the factory.
++    content::DevToolsServerStartResult result;
++    result.started = false;
++    result.reason = content::DevToolsServerStartResult::Reason::kSocketFailed;
++    result.net_error = net_error;
++    NotifyDevToolsServerStarted(result);
+   }
+ }
+ 
+@@ -274,15 +297,22 @@ void StartServerOnHandlerThread(
+     bool bundles_resources) {
+   DCHECK(thread->task_runner()->BelongsToCurrentThread());
+   std::unique_ptr<ServerWrapper> server_wrapper;
++  int net_error = net::OK;
+   std::unique_ptr<net::ServerSocket> server_socket =
+-      socket_factory->CreateForHttpServer();
++      socket_factory->CreateForHttpServer(&net_error);
+   std::unique_ptr<net::IPEndPoint> ip_address(new net::IPEndPoint);
+   if (server_socket) {
+     server_wrapper =
+         std::make_unique<ServerWrapper>(handler, std::move(server_socket),
+                                         debug_frontend_dir, bundles_resources);
+-    if (server_wrapper->GetLocalAddress(ip_address.get()) != net::OK)
++    const int local_address_error = server_wrapper->GetLocalAddress(
++        ip_address.get());
++    if (local_address_error != net::OK) {
++      // Listening socket whose local address could not be read; keep the
++      // original error for the start-result report.
++      net_error = local_address_error;
+       ip_address.reset();
++    }
+   } else {
+     ip_address.reset();
+   }
+@@ -316,7 +346,7 @@ void StartServerOnHandlerThread(
+       FROM_HERE,
+       base::BindOnce(&ServerStartedOnUI, std::move(handler), std::move(thread),
+                      server_wrapper.release(), socket_factory.release(),
+-                     std::move(ip_address)));
++                     std::move(ip_address), net_error));
+ }
+ 
+ // DevToolsAgentHostClientImpl -----------------------------------------------
+@@ -924,6 +954,15 @@ DevToolsHttpHandler::DevToolsHttpHandler(
+                        std::move(thread), std::move(socket_factory),
+                        output_directory, debug_frontend_dir, browser_guid_,
+                        delegate_->HasBundledFrontendResources()));
++  } else {
++    // Without the server thread no bind attempt ever happens and no
++    // ServerStartedOnUI will arrive; report the failure directly so the
++    // start result always has exactly one terminal outcome.
++    content::DevToolsServerStartResult result;
++    result.started = false;
++    result.reason =
++        content::DevToolsServerStartResult::Reason::kServerThreadFailed;
++    NotifyDevToolsServerStarted(result);
+   }
+   std::string remote_allow_origins = base::ToLowerASCII(
+       base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+diff --git content/browser/devtools/devtools_http_handler.h content/browser/devtools/devtools_http_handler.h
+index 107e08a782efa89707fedf315ac07ed2a22a88b3..b10d76251d0ad1f12d1f04df6c59fc52dc064388 100644
+--- content/browser/devtools/devtools_http_handler.h
++++ content/browser/devtools/devtools_http_handler.h
+@@ -71,7 +71,8 @@ class DevToolsHttpHandler {
+                                 std::unique_ptr<base::Thread> thread,
+                                 ServerWrapper* server_wrapper,
+                                 DevToolsSocketFactory* socket_factory,
+-                                std::unique_ptr<net::IPEndPoint> ip_address);
++                                std::unique_ptr<net::IPEndPoint> ip_address,
++                                int net_error);
+ 
+   void OnJsonRequest(int connection_id,
+                      const net::HttpServerRequestInfo& info);
+diff --git content/browser/devtools/devtools_http_handler_unittest.cc content/browser/devtools/devtools_http_handler_unittest.cc
+index 70454ecd7fed4a18970977c6afd48576c0ae3779..08526d636d5e25c2bef722c75f66576d67b47feb 100644
+--- content/browser/devtools/devtools_http_handler_unittest.cc
++++ content/browser/devtools/devtools_http_handler_unittest.cc
+@@ -93,9 +93,11 @@ class DummyServerSocketFactory : public DevToolsSocketFactory {
+   }
+ 
+  protected:
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     GetUIThreadTaskRunner({})->PostTask(FROM_HERE,
+                                         std::move(create_socket_callback_));
++    *net_error = net::OK;
+     return std::make_unique<DummyServerSocket>();
+   }
+ 
+@@ -116,9 +118,11 @@ class FailingServerSocketFactory : public DummyServerSocketFactory {
+                                  std::move(shutdown_callback)) {}
+ 
+  private:
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     GetUIThreadTaskRunner({})->PostTask(FROM_HERE,
+                                         std::move(create_socket_callback_));
++    *net_error = net::ERR_ADDRESS_IN_USE;
+     return nullptr;
+   }
+ };
+@@ -133,11 +137,12 @@ class TCPServerSocketFactory : public DummyServerSocketFactory {
+   int port() { return port_; }
+ 
+  private:
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     std::unique_ptr<net::ServerSocket> socket(
+         new net::TCPServerSocket(nullptr, net::NetLogSource()));
+-    while (socket->ListenWithAddressAndPort("127.0.0.1", port_, 10) !=
+-           net::OK) {
++    while ((*net_error = socket->ListenWithAddressAndPort("127.0.0.1", port_,
++                                                          10)) != net::OK) {
+       if (++port_ > kDummyPort + 100)
+         return nullptr;
+     }
+diff --git content/browser/devtools/devtools_server_start_observer.cc content/browser/devtools/devtools_server_start_observer.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e05910f7a99f73f1d065213618d3c4c08b794ca
+--- /dev/null
++++ content/browser/devtools/devtools_server_start_observer.cc
+@@ -0,0 +1,33 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "content/public/browser/devtools_server_start_observer.h"
++
++#include "base/check.h"
++#include "base/no_destructor.h"
++#include "content/public/browser/browser_thread.h"
++
++namespace content {
++namespace {
++DevToolsServerStartObserver& Observer() {
++  static base::NoDestructor<DevToolsServerStartObserver> observer;
++  return *observer;
++}
++}  // namespace
++
++void SetDevToolsServerStartObserver(DevToolsServerStartObserver observer) {
++  // SDK 在 CefInitialize 前注册，之后所有操作与通知均在浏览器 UI 线程。
++  // 不排队复制 callback；注销后不存在携带旧 userdata 的待执行任务。
++  CHECK(!BrowserThread::IsThreadInitialized(BrowserThread::UI) ||
++        BrowserThread::CurrentlyOn(BrowserThread::UI));
++  Observer() = std::move(observer);
++}
++
++void NotifyDevToolsServerStarted(const DevToolsServerStartResult& result) {
++  DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  if (Observer()) {
++    Observer().Run(result);
++  }
++}
++
++}  // namespace content
+diff --git content/public/browser/BUILD.gn content/public/browser/BUILD.gn
+index a1031fd99194bd983816b33fdf8cad5f7f5ced0c..00a0c194fd11556692dc3eb64b7741c972b6fc4c 100644
+--- content/public/browser/BUILD.gn
++++ content/public/browser/BUILD.gn
+@@ -155,6 +155,7 @@ source_set("browser_sources") {
+     "devtools_manager_delegate.h",
+     "devtools_network_transaction_factory.h",
+     "devtools_socket_factory.h",
++    "devtools_server_start_observer.h",
+     "digital_credentials_cross_device.h",
+     "digital_identity_interstitial_type.h",
+     "digital_identity_provider.cc",
+diff --git content/public/browser/devtools_server_start_observer.h content/public/browser/devtools_server_start_observer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..10407b325115f35078073569672d2083f90d1f43
+--- /dev/null
++++ content/public/browser/devtools_server_start_observer.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Process-wide observer for the remote debugging server start result.
++// The result is delivered on the UI thread by the actual socket owner
++// (DevToolsHttpHandler's server thread posts the outcome of the real
++// bind/listen attempt), so consumers never need to infer readiness from
++// log output, port polling, or browser-initialization success.
++
++#ifndef CONTENT_PUBLIC_BROWSER_DEVTOOLS_SERVER_START_OBSERVER_H_
++#define CONTENT_PUBLIC_BROWSER_DEVTOOLS_SERVER_START_OBSERVER_H_
++
++#include "base/functional/callback.h"
++#include "content/common/content_export.h"
++#include "net/base/ip_endpoint.h"
++#include "net/base/net_errors.h"
++
++namespace content {
++
++// Outcome of one remote debugging server start attempt.
++struct DevToolsServerStartResult {
++  enum class Reason {
++    // Server socket creation/listen (or local address lookup) failed.
++    // |net_error| carries the original net::Error code when available.
++    kSocketFailed,
++    // The start attempt was rejected by policy or preference before any
++    // socket was created. |net_error| is net::OK.
++    kDisallowed,
++    // The dedicated devtools server thread failed to start, so no bind
++    // attempt was made. |net_error| is net::OK.
++    kServerThreadFailed,
++  };
++
++  // True when the server socket was created and is listening. Note that a
++  // listening socket may still have an empty |endpoint| when the local
++  // address could not be read; consumers that must confirm the bound
++  // address need to check |endpoint| explicitly.
++  bool started = false;
++
++  Reason reason = Reason::kSocketFailed;
++
++  // Original net error code of the failed attempt (negative net::Error
++  // value), or net::OK when no underlying error is available. Never a
++  // fabricated status code.
++  int net_error = net::OK;
++
++  // Actual bound endpoint when known; empty otherwise.
++  net::IPEndPoint endpoint;
++};
++
++// Invoked on the UI thread with each start result. Must not call
++// SetDevToolsServerStartObserver() re-entrantly.
++using DevToolsServerStartObserver =
++    base::RepeatingCallback<void(const DevToolsServerStartResult&)>;
++
++// Register before browser initialization and before requesting server startup.
++// Once the UI thread exists, registration and unregistration must run on it.
++// An empty callback unregisters synchronously; no result or callback is cached.
++CONTENT_EXPORT void SetDevToolsServerStartObserver(
++    DevToolsServerStartObserver observer);
++
++// Called on the UI thread by the DevTools HTTP handler (and by the
++// embedder-side start request path when the attempt is rejected before a
++// socket exists) with the outcome of a start attempt.
++CONTENT_EXPORT void NotifyDevToolsServerStarted(
++    const DevToolsServerStartResult& result);
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_DEVTOOLS_SERVER_START_OBSERVER_H_
+diff --git content/public/browser/devtools_socket_factory.h content/public/browser/devtools_socket_factory.h
+index 035855a87b97b4c5d849cf11f1d0ffa467f0b580..fddca39e3f2e25793ffe67c0b345efae0bc8b060 100644
+--- content/public/browser/devtools_socket_factory.h
++++ content/public/browser/devtools_socket_factory.h
+@@ -20,7 +20,11 @@ class DevToolsSocketFactory {
+   virtual ~DevToolsSocketFactory() {}
+ 
+   // Returns a new instance of ServerSocket or nullptr if an error occurred.
+-  virtual std::unique_ptr<net::ServerSocket> CreateForHttpServer() = 0;
++  // |net_error| is always non-null and receives the original net::Error code
++  // of the failed attempt (net::OK on success) so that failures can be
++  // reported with their real cause instead of an inferred status.
++  virtual std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) = 0;
+ 
+   // Creates a named socket for reversed tethering implementation (used with
+   // remote debugging, primarily for mobile).
+diff --git content/shell/browser/shell_devtools_manager_delegate.cc content/shell/browser/shell_devtools_manager_delegate.cc
+index 856b49d3ccb306b0e66173566dd5617cc4a8a446..e3b5690371ac30204e7a1e0fc3dceed97cf45282 100644
+--- content/shell/browser/shell_devtools_manager_delegate.cc
++++ content/shell/browser/shell_devtools_manager_delegate.cc
+@@ -61,12 +61,14 @@ class UnixDomainServerSocketFactory : public content::DevToolsSocketFactory {
+ 
+  private:
+   // content::DevToolsSocketFactory.
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     std::unique_ptr<net::UnixDomainServerSocket> socket(
+         new net::UnixDomainServerSocket(
+             base::BindRepeating(&CanUserConnectToDevTools),
+             true /* use_abstract_namespace */));
+-    if (socket->BindAndListen(socket_name_, kBackLog) != net::OK)
++    *net_error = socket->BindAndListen(socket_name_, kBackLog);
++    if (*net_error != net::OK)
+       return nullptr;
+ 
+     return std::move(socket);
+@@ -90,10 +92,12 @@ class TCPServerSocketFactory : public content::DevToolsSocketFactory {
+ 
+  private:
+   // content::DevToolsSocketFactory.
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     std::unique_ptr<net::ServerSocket> socket(
+         new net::TCPServerSocket(nullptr, net::NetLogSource()));
+-    if (socket->ListenWithAddressAndPort(address_, port_, kBackLog) != net::OK)
++    *net_error = socket->ListenWithAddressAndPort(address_, port_, kBackLog);
++    if (*net_error != net::OK)
+       return nullptr;
+ 
+     net::IPEndPoint endpoint;
+diff --git headless/lib/browser/headless_devtools.cc headless/lib/browser/headless_devtools.cc
+index b615930a3780726b1465e00ef802a52defdb4924..27ac753ef302e627e2f237351ab8fa30a0ede1f7 100644
+--- headless/lib/browser/headless_devtools.cc
++++ headless/lib/browser/headless_devtools.cc
+@@ -39,20 +39,30 @@ class TCPServerSocketFactory : public content::DevToolsSocketFactory {
+   // This function, and the logic below that uses it, is copied from
+   // chrome/browser/devtools/remote_debugging_server.cc
+   static std::unique_ptr<net::ServerSocket> CreateLocalHostServerSocket(
+-      int port) {
++      int port,
++      int* net_error) {
+     std::unique_ptr<net::ServerSocket> socket(
+         new net::TCPServerSocket(nullptr, net::NetLogSource()));
+-    if (socket->ListenWithAddressAndPort("127.0.0.1", port, kBackLog) ==
+-        net::OK)
++    int result = socket->ListenWithAddressAndPort("127.0.0.1", port,
++                                                  kBackLog);
++    if (result == net::OK) {
++      *net_error = net::OK;
+       return socket;
+-    if (socket->ListenWithAddressAndPort("::1", port, kBackLog) == net::OK)
++    }
++    // Keep the IPv4 loopback error as the primary cause; a subsequent ::1
++    // failure (e.g. from a disabled IPv6 stack) must not mask it.
++    *net_error = result;
++    if (socket->ListenWithAddressAndPort("::1", port, kBackLog) == net::OK) {
++      *net_error = net::OK;
+       return socket;
++    }
+     return nullptr;
+   }
+ 
+   // content::DevToolsSocketFactory.
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
+-    return CreateLocalHostServerSocket(port_);
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
++    return CreateLocalHostServerSocket(port_, net_error);
+   }
+ 
+   std::unique_ptr<net::ServerSocket> CreateForTethering(
+@@ -75,10 +85,12 @@ class TCPAdoptServerSocketFactory : public content::DevToolsSocketFactory {
+       delete;
+ 
+  private:
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
+     std::unique_ptr<net::TCPServerSocket> tsock(
+         new net::TCPServerSocket(nullptr, net::NetLogSource()));
+-    if (tsock->AdoptSocket(socket_fd_) != net::OK) {
++    *net_error = tsock->AdoptSocket(socket_fd_);
++    if (*net_error != net::OK) {
+       LOG(ERROR) << "Failed to adopt open socket";
+       return nullptr;
+     }
+@@ -106,7 +118,9 @@ class DummyTCPServerSocketFactory : public content::DevToolsSocketFactory {
+       delete;
+ 
+  private:
+-  std::unique_ptr<net::ServerSocket> CreateForHttpServer() override {
++  std::unique_ptr<net::ServerSocket> CreateForHttpServer(
++      int* net_error) override {
++    *net_error = net::OK;
+     return nullptr;
+   }
+ 

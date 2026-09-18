@@ -1,0 +1,580 @@
+目的：实际渲染与申报视口分离、原生屏幕和时区覆盖、子进程配置传播及 WebRTC 原生策略。
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：原生窗口与 OSR 实际渲染尺寸一致；申报尺寸、媒体查询及显式设备模拟符合 profile；保留 fenced frame、跨站隔离、时区及 WebRTC 安全边界。
+
+diff --git cef/libcef/browser/chrome/chrome_content_browser_client_cef.cc cef/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+index 06b6f895433c4ce0fa93dab7d38392ffa4bf48a1..38e75a5071150d2cc68a27974558f43bb11325b8 100644
+--- cef/libcef/browser/chrome/chrome_content_browser_client_cef.cc
++++ cef/libcef/browser/chrome/chrome_content_browser_client_cef.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "cef/include/wrapper/cef_library_loader.h"
+ #include "cef/libcef/browser/browser_frame.h"
+ #include "cef/libcef/browser/browser_host_base.h"
+@@ -33,6 +34,8 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "chrome/common/chrome_switches.h"
++#include "components/iris/engine_protocol.h"
++#include "components/iris/profile_data.h"
+ #include "components/performance_manager/embedder/performance_manager_registry.h"
+ #include "content/public/browser/client_certificate_delegate.h"
+ #include "content/public/browser/navigation_throttle.h"
+@@ -227,6 +230,11 @@ void ChromeContentBrowserClientCef::AppendExtraCommandLineSwitches(
+         switches::kLogSeverity,
+         switches::kResourcesDirPath,
+         switches::kUserAgentProductAndVersion,
++        // Iris: seed/timezone 必须到达每个子进程（renderer/GPU/utility，
++        // 含崩溃后重建的进程），delegate 在各进程入口读取并冻结配置；
++        // 缺失时子进程以 kInvalidArgumentExit 退出，不会静默回退宿主身份。
++        iris_engine::kSeedSwitch,
++        iris_engine::kTimezoneSwitch,
+     };
+     command_line->CopySwitchesFrom(*browser_cmd, kSwitchNames);
+   }
+@@ -441,6 +449,31 @@ void ChromeContentBrowserClientCef::OverrideWebPreferences(
+         CefContext::Get()->GetBackgroundColor(nullptr, STATE_DEFAULT);
+   }
+ 
++  // Iris: 泛型字体设置晚于 Chrome 和 embedder 默认值写入；不留下宿主
++  // per-script 配置。DOM 的名称限制在字体选择器中执行，Canvas 保留完整
++  // 泛型解析。system-ui、字形回退和远程 webfont 继续使用原生字体后端。
++  prefs->standard_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kStandardFont))}};
++  prefs->fixed_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kMonospaceFont))}};
++  prefs->serif_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kSerifFont))}};
++  prefs->sans_serif_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kSansSerifFont))}};
++  prefs->cursive_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kCursiveFont))}};
++  prefs->fantasy_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kFantasyFont))}};
++  prefs->math_font_family_map = {
++      {blink::web_pref::kCommonScript,
++       base::UTF8ToUTF16(std::string(iris::profile::kMathFont))}};
++
+   web_contents->SetPageBaseBackgroundColor(base_background_color);
+ }
+ 
+diff --git cef/libcef/browser/media_access_query.cc cef/libcef/browser/media_access_query.cc
+index 65b52df5e6878bf5d4cbbc45efecde832dfc7c4c..5563a3a0d94034ad27bba6d1e6582094f17d3f3c 100644
+--- cef/libcef/browser/media_access_query.cc
++++ cef/libcef/browser/media_access_query.cc
+@@ -354,8 +354,9 @@ bool CheckMediaAccessPermission(CefBrowserHostBase* browser,
+                                 content::RenderFrameHost* render_frame_host,
+                                 const url::Origin& security_origin,
+                                 blink::mojom::MediaStreamType type) {
+-  // Always allowed here. RequestMediaAccessPermission will be called.
+-  return true;
++  // Iris: 无既有授权时枚举返回脱敏条目；授权请求仍走
++  // RequestMediaAccessPermission 的正常流程。
++  return false;
+ }
+ 
+ content::MediaResponseCallback RequestMediaAccessPermission(
+diff --git cef/libcef/common/chrome/chrome_main_delegate_cef.cc cef/libcef/common/chrome/chrome_main_delegate_cef.cc
+index cc28f6fd9232be3ad15c0d684bc114e209d0c228..806b4e5fbdcdc743efc80c6f028fba4ea62982e0 100644
+--- cef/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ cef/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -31,6 +31,10 @@
+ #include "components/embedder_support/switches.h"
+ #include "components/iris/engine_protocol.h"
+ #include "components/iris/profile.h"
++#include "ui/display/display_switches.h"
++#if BUILDFLAG(IS_WIN)
++#include "ui/gfx/win/direct_write.h"
++#endif
+ #include "components/lens/lens_features.h"
+ #include "components/variations/service/buildflags.h"
+ #include "content/common/features.h"
+@@ -38,6 +42,7 @@
+ #include "net/base/features.h"
+ #include "sandbox/policy/switches.h"
+ #include "third_party/blink/public/common/switches.h"
++#include "third_party/icu/source/i18n/unicode/timezone.h"
+ #include "ui/base/ui_base_paths.h"
+ #include "ui/base/ui_base_switches.h"
+ 
+@@ -327,7 +332,7 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
+       }
+     }
+ 
+-    if (settings_->remote_debugging_port >= 1024 &&
++    if (settings_->remote_debugging_port >= 1 &&
+         settings_->remote_debugging_port <= 65535) {
+       command_line->AppendSwitchASCII(
+           switches::kRemoteDebuggingPort,
+@@ -340,7 +345,10 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
+           base::NumberToString(settings_->uncaught_exception_stack_size));
+     }
+ 
+-    std::vector<std::string> disable_features;
++    // JS 与网络共用完整 profile 语言；不能被实验分组再次缩减。
++    std::vector<std::string> disable_features = {
++        "ReduceAcceptLanguage", "ReduceAcceptLanguageHTTP",
++        "ReduceAcceptLanguageCount"};
+ 
+     if (!!settings_->multi_threaded_message_loop) {
+       // Disable EnableHangWatcher when running with multi-threaded-message-loop
+@@ -418,6 +426,22 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
+     return iris_engine::kInvalidArgumentExit;
+   }
+ 
++  if (process_type.empty()) {
++    if (command_line->HasSwitch(switches::kForceDeviceScaleFactor)) {
++      double scale = 0;
++      if (!base::StringToDouble(command_line->GetSwitchValueASCII(
++                                   switches::kForceDeviceScaleFactor),
++                               &scale) ||
++          scale != iris::profile::kDeviceScaleFactor) {
++        return iris_engine::kInvalidArgumentExit;
++      }
++    } else {
++      command_line->AppendSwitchASCII(
++          switches::kForceDeviceScaleFactor,
++          base::NumberToString(iris::profile::kDeviceScaleFactor));
++    }
++  }
++
+   // Call as early as possible.
+   InitLogging(command_line);
+ 
+@@ -532,7 +556,27 @@ std::variant<int, content::MainFunctionParams>
+ ChromeMainDelegateCef::RunProcess(
+     const std::string& process_type,
+     content::MainFunctionParams main_function_params) {
++  // BasicStartupComplete 时 ICU 尚未初始化；在所有进程的实际入口前校验，
++  // 不把未知 ID 静默映射到 GMT。这里只校验，不修改宿主系统时区。
++  const auto& timezone = iris::GetRuntimeConfig().timezone;
++  if (!timezone.empty()) {
++    UErrorCode error = U_ZERO_ERROR;
++    UBool is_system_id = false;
++    icu::UnicodeString canonical;
++    icu::TimeZone::getCanonicalID(icu::UnicodeString::fromUTF8(timezone),
++                                canonical, is_system_id, error);
++    if (U_FAILURE(error) || !is_system_id) {
++      return iris_engine::kInvalidArgumentExit;
++    }
++  }
+   if (process_type.empty()) {
++#if BUILDFLAG(IS_WIN)
++    // BrowserMainRunnerImpl 随后初始化字体栈；先验证限集，缺失时返回 SDK
++    // 可识别的错误，而不是让首次字体查询落到宿主字体或 CHECK 崩溃。
++    if (FAILED(gfx::win::PreflightIrisFontProfile())) {
++      return iris_engine::kProfileUnavailableExit;
++    }
++#endif
+     return runner_->RunMainProcess(std::move(main_function_params));
+   }
+ 
+diff --git content/browser/BUILD.gn content/browser/BUILD.gn
+index 7b194eabd7b0b327e6ffbc148c8809dd9bc0a6e5..cea9156a5cff4ce76bffadf8a2a9124c7fac9297 100644
+--- content/browser/BUILD.gn
++++ content/browser/BUILD.gn
+@@ -158,6 +158,7 @@ source_set("browser") {
+     "//components/filename_generation",
+     "//components/history/core/browser:features",
+     "//components/input",
++    "//components/iris",
+     "//components/language/core/common",
+     "//components/language_detection/content/common",
+     "//components/link_header_util",
+diff --git content/browser/renderer_host/DEPS content/browser/renderer_host/DEPS
+index ecf15a34b4a3e96e0eef0d9e20c24919e6f2f887..91099491479151bb777c8766d077af35220bb947 100644
+--- content/browser/renderer_host/DEPS
++++ content/browser/renderer_host/DEPS
+@@ -61,6 +61,7 @@ specific_include_rules = {
+     "+ui/ozone/public/ozone_platform.h",
+   ],
+   "render_widget_host_view_base\\.cc": [
++    "+components/iris",
+     "+ui/ozone/public/ozone_platform.h",
+   ],
+   "render_widget_host_view_mac\\.mm": [
+diff --git content/browser/renderer_host/render_widget_host_view_base.cc content/browser/renderer_host/render_widget_host_view_base.cc
+index 796221b15d6ae553858c7bc7208e747b57128a34..f3f4c9114f312147c933bf8b622599d9b8ca5ef0 100644
+--- content/browser/renderer_host/render_widget_host_view_base.cc
++++ content/browser/renderer_host/render_widget_host_view_base.cc
+@@ -19,6 +19,7 @@
+ #include "components/input/event_with_latency_info.h"
+ #include "components/input/render_widget_host_input_event_router.h"
+ #include "components/input/render_widget_host_view_input_observer.h"
++#include "components/iris/profile_data.h"
+ #include "components/viz/common/features.h"
+ #include "components/viz/common/surfaces/subtree_capture_id.h"
+ #include "components/viz/host/host_frame_sink_manager.h"
+@@ -565,6 +566,40 @@ void RenderWidgetHostViewBase::UpdateScreenInfo() {
+   auto new_screen_infos = GetNewScreenInfosForUpdate();
+   new_screen_infos.mutable_current().handwriting_radius = handwriting_radius_;
+ 
++  // Iris: 统一虚拟显示身份。windowed(Aura) 与 OSR 的 screen info 产线在此
++  // 汇合（OSR 覆写 GetNewScreenInfosForUpdate，但两者都走本函数）。仅替换
++  // 身份字段（尺寸、可用区、DPR、位深、方向、单屏/主屏、标签）；真实
++  // display 的色彩空间、光标大小、手写半径、display_id 等能力/簿记字段保留。
++  // renderer 的 CSS media query、screen API、orientation 与截图均消费该值，
++  // 宿主分辨率/显示器变化后该值保持不变（不触发虚假 resize）。真实窗口
++  // bounds/viewport 不受影响；浏览器启动 device scale 必须与 profile 一致
++  // （delegate 追加 force-device-scale-factor），否则输入换算与合成仍按宿主
++  // 物理像素缩放。
++  {
++    display::ScreenInfo iris_screen = new_screen_infos.current();
++    iris_screen.rect =
++        gfx::Rect(iris::profile::kScreenWidth, iris::profile::kScreenHeight);
++    iris_screen.available_rect = gfx::Rect(iris::profile::kAvailableWidth,
++                                           iris::profile::kAvailableHeight);
++    iris_screen.device_scale_factor =
++        static_cast<float>(iris::profile::kDeviceScaleFactor);
++    iris_screen.depth = iris::profile::kColorDepth;
++    // 总位深可包含 alpha；CSS color 查询只描述单个 RGB 分量。
++    iris_screen.depth_per_component = iris::profile::kDepthPerComponent;
++    iris_screen.is_monochrome = false;
++    static_assert(iris::profile::kScreenOrientation == "landscape-primary");
++    iris_screen.orientation_type =
++        display::mojom::ScreenOrientation::kLandscapePrimary;
++    iris_screen.orientation_angle = 0;
++    iris_screen.is_extended = false;
++    iris_screen.is_primary = true;
++    iris_screen.label.clear();
++    const int64_t iris_display_id = iris_screen.display_id;
++    new_screen_infos.screen_infos.clear();
++    new_screen_infos.screen_infos.push_back(std::move(iris_screen));
++    new_screen_infos.current_display_id = iris_display_id;
++  }
++
+   if (scale_override_for_capture_ != 1.0f) {
+     // If HiDPI capture mode is active, adjust the device scale factor to
+     // increase the rendered pixel count. |new_screen_infos| always contains the
+diff --git third_party/blink/common/features.cc third_party/blink/common/features.cc
+index 6e2c2f0a85fd96bb0ad4af166a03543671204347..4b9d9df669561d722e9cae31c2f75d7c0a0b11e8 100644
+--- third_party/blink/common/features.cc
++++ third_party/blink/common/features.cc
+@@ -2565,7 +2565,9 @@ BASE_FEATURE(kWebFontsCacheAwareTimeoutAdaption,
+ // Causes WebRTC to replace host ICE candidate IP addresses with generated
+ // names ending in ".local" and resolve them using mDNS.
+ // http://crbug.com/878465
+-BASE_FEATURE(kWebRtcHideLocalIpsWithMdns, base::FEATURE_ENABLED_BY_DEFAULT);
++// Iris: 与参考引擎一致，关闭 mDNS 主机名，宿主候选项以 0.0.0.0/[::]
++// 通配地址上报（不泄露真实 IP）。
++BASE_FEATURE(kWebRtcHideLocalIpsWithMdns, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Causes WebRTC to not set the color space of video frames on the receive side
+ // in case it's unspecified. Otherwise we will guess that the color space is
+diff --git third_party/blink/renderer/core/css/media_values.cc third_party/blink/renderer/core/css/media_values.cc
+index 0d602447425065814467b274270fc37d25a3a010..9cc144553998a176a608477a2a9b14fc75f90d6c 100644
+--- third_party/blink/renderer/core/css/media_values.cc
++++ third_party/blink/renderer/core/css/media_values.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/core/css/media_values.h"
+ 
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/common/css/scripting.h"
+ #include "third_party/blink/renderer/core/css/css_resolution_units.h"
+ #include "third_party/blink/renderer/core/css/css_to_length_conversion_data.h"
+@@ -110,6 +111,9 @@ double MediaValues::CalculateViewportWidth(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->View());
+   DCHECK(frame->GetDocument());
++  if (!frame->IsInFencedFrameTree() && !frame->IsScreenMetricsEmulated()) {
++    return iris::profile::kInnerWidth;
++  }
+   return frame->View()->ViewportSizeForMediaQueries().width();
+ }
+ 
+@@ -117,6 +121,9 @@ double MediaValues::CalculateViewportHeight(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->View());
+   DCHECK(frame->GetDocument());
++  if (!frame->IsInFencedFrameTree() && !frame->IsScreenMetricsEmulated()) {
++    return iris::profile::kInnerHeight;
++  }
+   return frame->View()->ViewportSizeForMediaQueries().height();
+ }
+ 
+@@ -455,7 +462,7 @@ bool MediaValues::CalculatePrefersReducedMotion(LocalFrame* frame) {
+       preference_overrides ? preference_overrides->GetPrefersReducedMotion()
+                            : std::nullopt;
+   return preference_override_value.value_or(
+-      frame->GetSettings()->GetPrefersReducedMotion());
++      iris::profile::kPrefersReducedMotion);
+ }
+ 
+ bool MediaValues::CalculatePrefersReducedData(LocalFrame* frame) {
+diff --git third_party/blink/renderer/core/frame/dom_visual_viewport.cc third_party/blink/renderer/core/frame/dom_visual_viewport.cc
+index 288b859abab18990e6545cb04e6161f641b7cf1a..73869ee52b0941e25b98a5c3cc9ff9cd6780f19e 100644
+--- third_party/blink/renderer/core/frame/dom_visual_viewport.cc
++++ third_party/blink/renderer/core/frame/dom_visual_viewport.cc
+@@ -25,6 +25,7 @@
+ 
+ #include "third_party/blink/renderer/core/frame/dom_visual_viewport.h"
+ 
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/element.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+@@ -152,8 +153,12 @@ double DOMVisualViewport::width() const {
+                                             frame->LayoutZoomFactor());
+   }
+ 
+-  if (Page* page = frame->GetPage())
++  if (Page* page = frame->GetPage()) {
++    if (!frame->IsScreenMetricsEmulated()) {
++      return iris::profile::kInnerWidth;
++    }
+     return page->GetVisualViewport().Width();
++  }
+ 
+   return 0;
+ }
+@@ -174,8 +179,12 @@ double DOMVisualViewport::height() const {
+                                             frame->LayoutZoomFactor());
+   }
+ 
+-  if (Page* page = frame->GetPage())
++  if (Page* page = frame->GetPage()) {
++    if (!frame->IsScreenMetricsEmulated()) {
++      return iris::profile::kInnerHeight;
++    }
+     return page->GetVisualViewport().Height();
++  }
+ 
+   return 0;
+ }
+diff --git third_party/blink/renderer/core/frame/local_dom_window.cc third_party/blink/renderer/core/frame/local_dom_window.cc
+index 7f47ea8822dcf813c0b5ec8b9a51aed03c8d32f1..6c9e795a8cac08a22ca29a51cc73b9890a263b7f 100644
+--- third_party/blink/renderer/core/frame/local_dom_window.cc
++++ third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -37,6 +37,7 @@
+ #include "base/trace_event/typed_macros.h"
+ #include "build/build_config.h"
+ #include "cc/input/snap_selection_strategy.h"
++#include "components/iris/profile_data.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "net/storage_access_api/status.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -1686,6 +1687,10 @@ int LocalDOMWindow::outerHeight() const {
+     return 0;
+   }
+ 
++  if (!frame->IsScreenMetricsEmulated()) {
++    return iris::profile::kOuterHeight;
++  }
++
+   ChromeClient& chrome_client = page->GetChromeClient();
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+@@ -1718,6 +1723,10 @@ int LocalDOMWindow::outerWidth() const {
+     return 0;
+   }
+ 
++  if (!frame->IsScreenMetricsEmulated()) {
++    return iris::profile::kOuterWidth;
++  }
++
+   ChromeClient& chrome_client = page->GetChromeClient();
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+@@ -1770,6 +1779,12 @@ int LocalDOMWindow::innerHeight() const {
+     return 0;
+   }
+ 
++  // 申报视口不参与布局；子帧尺寸和显式设备模拟仍走原生路径。
++  if (GetFrame()->IsOutermostMainFrame() && GetFrame()->View() &&
++      GetFrame()->GetPage() && !GetFrame()->IsScreenMetricsEmulated()) {
++    return iris::profile::kInnerHeight;
++  }
++
+   return AdjustForAbsoluteZoom::AdjustInt(GetViewportSize().height(),
+                                           GetFrame()->LayoutZoomFactor());
+ }
+@@ -1779,6 +1794,11 @@ int LocalDOMWindow::innerWidth() const {
+     return 0;
+   }
+ 
++  if (GetFrame()->IsOutermostMainFrame() && GetFrame()->View() &&
++      GetFrame()->GetPage() && !GetFrame()->IsScreenMetricsEmulated()) {
++    return iris::profile::kInnerWidth;
++  }
++
+   return AdjustForAbsoluteZoom::AdjustInt(GetViewportSize().width(),
+                                           GetFrame()->LayoutZoomFactor());
+ }
+@@ -1794,6 +1814,10 @@ int LocalDOMWindow::screenX() const {
+     return 0;
+   }
+ 
++  if (!frame->IsScreenMetricsEmulated()) {
++    return 0;
++  }
++
+   ChromeClient& chrome_client = page->GetChromeClient();
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+@@ -1819,6 +1843,10 @@ int LocalDOMWindow::screenY() const {
+     return 0;
+   }
+ 
++  if (!frame->IsScreenMetricsEmulated()) {
++    return 0;
++  }
++
+   ChromeClient& chrome_client = page->GetChromeClient();
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+diff --git third_party/blink/renderer/core/frame/local_frame.cc third_party/blink/renderer/core/frame/local_frame.cc
+index fca86cb7f612b434bcce072bd21740c03e24e8a9..9aff40da018a4d1c8a99489cc27d3cbd41330971 100644
+--- third_party/blink/renderer/core/frame/local_frame.cc
++++ third_party/blink/renderer/core/frame/local_frame.cc
+@@ -2356,6 +2356,12 @@ FrameWidget* LocalFrame::GetWidgetForLocalRoot() {
+   return web_frame->LocalRootFrameWidget();
+ }
+ 
++bool LocalFrame::IsScreenMetricsEmulated() {
++  auto* web_frame = WebLocalFrameImpl::FromFrame(this);
++  auto* widget = web_frame ? web_frame->LocalRootFrameWidget() : nullptr;
++  return widget && widget->DeviceEmulator();
++}
++
+ WebContentSettingsClient* LocalFrame::GetContentSettingsClient() {
+   return Client() ? Client()->GetContentSettingsClient() : nullptr;
+ }
+diff --git third_party/blink/renderer/core/frame/local_frame.h third_party/blink/renderer/core/frame/local_frame.h
+index ba6ec933a429fc5a4b96e3ba3b8d809f8f5fc21f..d9ce552b6b2da323d436622a3a254425ffee2886 100644
+--- third_party/blink/renderer/core/frame/local_frame.h
++++ third_party/blink/renderer/core/frame/local_frame.h
+@@ -529,6 +529,9 @@ class CORE_EXPORT LocalFrame final
+   // devtools), it will always be null.
+   FrameWidget* GetWidgetForLocalRoot();
+ 
++  // Device emulation belongs to the local root, not remote ancestors.
++  bool IsScreenMetricsEmulated();
++
+   WebContentSettingsClient* GetContentSettingsClient();
+   const mojom::RendererContentSettingsPtr& GetContentSettings() const;
+ 
+diff --git third_party/blink/renderer/core/timezone/timezone_controller.cc third_party/blink/renderer/core/timezone/timezone_controller.cc
+index 270c78bfd0332ed53e21db79b02abac8cc1209a5..66d7216d184a8cd01c1899deabc40a52931b1113 100644
+--- third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -4,8 +4,10 @@
+ 
+ #include "third_party/blink/renderer/core/timezone/timezone_controller.h"
+ 
++#include "base/check.h"
+ #include "base/command_line.h"
+ #include "base/feature_list.h"
++#include "components/iris/profile.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -117,6 +119,26 @@ void TimeZoneController::Init() {
+   Platform::Current()->GetBrowserInterfaceBroker()->GetInterface(
+       monitor.BindNewPipeAndPassReceiver());
+   monitor->AddClient(instance().receiver_.BindNewPipeAndPassRemote());
++
++  // Iris: 显式 profile 时区在 Blink 初始化（首个 script context / worker
++  // 创建之前）应用。RAII override handle 故意泄漏给进程生命周期持有：
++  // OnTimeZoneChange 只更新 host_timezone_id_（HasTimeZoneOverride 时不重新
++  // 应用），宿主 Windows 时区变化与浏览器侧推送都不会覆盖显式 zone，也不
++  // 修改宿主系统时区。timezone 为空时保持上游跟随宿主的行为。
++  // zone 合法性已由 browser delegate 在本进程入口用 ICU getCanonicalID 校验
++  // 过，kInvalidTimezone/kAlreadyInEffect 在此不可达；若仍发生则终止进程，
++  // 不回退泄漏宿主时区。
++  // V8 snapshot 等构建工具也初始化 Blink，但没有浏览器运行配置和显式时区。
++  // 这里只读取可选 override；需要 seed 的运行路径仍要求完成进程初始化。
++  const std::string_view iris_timezone = iris::GetTimezoneOverride();
++  if (!iris_timezone.empty()) {
++    TimeZoneOverrideResult result =
++        SetTimeZoneOverride(String::FromUtf8(iris_timezone));
++    CHECK(result.status == TimeZoneOverrideStatus::kSuccess)
++        << "iris timezone override failed: " << iris_timezone;
++    [[maybe_unused]] static TimeZoneOverride* const leaked_override =
++        result.handle.release();
++  }
+ }
+ 
+ // static
+diff --git third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+index 929877a6cd4404370db0377249452eee1d6d8737..71ee6176f3f3780e9c4af979f472a8834a54c134 100644
+--- third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -1119,8 +1119,9 @@ PeerConnectionDependencyFactory::CreatePortAllocator(
+               << ", allow_mdns_obfuscation: " << allow_mdns_obfuscation;
+     }
+     if (port_config.enable_multiple_routes) {
+-      media_permission =
+-          blink::Platform::Current()->GetWebRTCMediaPermission(web_frame);
++      // Iris: 与参考引擎一致，不接入媒体权限门禁（接口地址已通配化），
++      // FilteringNetworkManager 走未启用门禁的 ALLOWED 路径。
++      media_permission = nullptr;
+     }
+   }
+ 
+diff --git third_party/blink/renderer/platform/p2p/ipc_network_manager.cc third_party/blink/renderer/platform/p2p/ipc_network_manager.cc
+index 12bd5a374bd823fd23e201e899db878f082005ca..4fad188ee3fea266ddb84a182e33881c32e9ce91 100644
+--- third_party/blink/renderer/platform/p2p/ipc_network_manager.cc
++++ third_party/blink/renderer/platform/p2p/ipc_network_manager.cc
+@@ -113,8 +113,11 @@ void IpcNetworkManager::OnNetworkListChanged(
+   // interfaces discovered.
+   std::vector<std::unique_ptr<webrtc::Network>> networks;
+   for (auto it = list.begin(); it != list.end(); it++) {
+-    webrtc::IPAddress ip_address =
+-        webrtc::NetIPAddressToRtcIPAddress(it->address);
++    // Iris: 与参考引擎一致，接口地址以同族通配字面量上报
++    // （0.0.0.0 / ::），不泄露真实本机 IP；网络结构保持真实。
++    webrtc::IPAddress ip_address = it->address.IsIPv4()
++                                       ? webrtc::IPAddress(INADDR_ANY)
++                                       : webrtc::IPAddress(in6addr_any);
+     DCHECK(!ip_address.IsNil());
+ 
+     webrtc::IPAddress prefix =
+@@ -175,15 +178,15 @@ void IpcNetworkManager::OnNetworkListChanged(
+   }
+ 
+   // Update the default local addresses.
++  // Iris: 默认路由地址同样以通配字面量上报，避免经
++  // MaybeSetDefaultLocalAddress 回填真实 IP。
+   webrtc::IPAddress ipv4_default;
+   webrtc::IPAddress ipv6_default;
+   if (use_default_ipv4_address) {
+-    ipv4_default =
+-        webrtc::NetIPAddressToRtcIPAddress(default_ipv4_local_address);
++    ipv4_default = webrtc::IPAddress(INADDR_ANY);
+   }
+   if (use_default_ipv6_address) {
+-    ipv6_default =
+-        webrtc::NetIPAddressToRtcIPAddress(default_ipv6_local_address);
++    ipv6_default = webrtc::IPAddress(in6addr_any);
+   }
+   set_default_local_addresses(ipv4_default, ipv6_default);
+ 
+diff --git third_party/webrtc/p2p/client/basic_port_allocator.cc third_party/webrtc/p2p/client/basic_port_allocator.cc
+index 3b36570b2031475ae9d5d3cfe4372323159f9a58..848590e02d489ae1d9fd53953f62853895a58695 100644
+--- third_party/webrtc/p2p/client/basic_port_allocator.cc
++++ third_party/webrtc/p2p/client/basic_port_allocator.cc
+@@ -134,8 +134,10 @@ bool IsAllowedByCandidateFilter(const Candidate& c, uint32_t filter) {
+   // returns all 0s, but after sending packets, it'll be the NIC used to
+   // send. All 0s is not a valid ICE candidate address and should be filtered
+   // out.
++  // Iris: 与参考引擎一致，枚举禁用时上报 0.0.0.0 / :: 通配主机候选，
++  // 让 onicecandidate 暴露通配字面量而非真实地址或空集。
+   if (c.address().IsAnyIP()) {
+-    return false;
++    return c.is_local() && (filter & CF_HOST) != 0;
+   }
+ 
+   if (c.is_relay()) {

@@ -1,0 +1,9 @@
+// 由 native CMake 从引擎分发清单（iris-distribution.json）生成；勿手动修改。
+// 该值同时被嵌入 lib/stravia_iris.lib：运行时与引擎导出的
+// iris_engine_build_id 逐字节比对，不一致即拒绝运行（原版基线无该导出）。
+#ifndef STRAVIA_IRIS_IRIS_BUILD_ID_H_
+#define STRAVIA_IRIS_IRIS_BUILD_ID_H_
+
+#define IRIS_ENGINE_BUILD_ID "@IRIS_ENGINE_BUILD_ID@"
+
+#endif  // STRAVIA_IRIS_IRIS_BUILD_ID_H_

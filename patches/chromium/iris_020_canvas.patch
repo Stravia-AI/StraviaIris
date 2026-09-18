@@ -1,0 +1,226 @@
+目的：只在 Canvas 编码导出边界处理独占像素；保留原生读回、渲染、转移及颜色转换
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：toDataURL、toBlob、convertToBlob 使用同一导出掩码；getImageData、渲染快照和帧传输不受扰动
+
+diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index d1193b68f5051b66675475a72ce2925ff869003f..8ae852f0721b4b1414831d25b63d6ee2186a51c6 100644
+--- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -1285,7 +1285,8 @@ String HTMLCanvasElement::ToDataURLInternal(
+       ImageEncoderUtils::ToEncodingMimeType(
+           mime_type, ImageEncoderUtils::kEncodeReasonToDataURL);
+ 
+-  scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
++  scoped_refptr<StaticBitmapImage> image_bitmap =
++      ImageDataBuffer::CreateCanvasSnapshot(Snapshot(source_buffer));
+   if (image_bitmap) {
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+@@ -1390,7 +1391,8 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+           mime_type, ImageEncoderUtils::kEncodeReasonToBlobCallback);
+ 
+   CanvasAsyncBlobCreator* async_creator = nullptr;
+-  scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(kBackBuffer);
++  scoped_refptr<StaticBitmapImage> image_bitmap =
++      ImageDataBuffer::CreateCanvasSnapshot(Snapshot(kBackBuffer));
+   if (image_bitmap) {
+     auto* options = ImageEncodeOptions::Create();
+     options->setType(ImageEncoderUtils::MimeTypeName(encoding_mime_type));
+diff --git third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+index 97e94a4aa123d364fb2430b842df342760797bf6..77da5fb9960481b7725dd8aa6a249a8d27195fc0 100644
+--- third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
++++ third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+@@ -45,6 +45,7 @@
+ #include "third_party/blink/renderer/platform/graphics/gpu/canvas_utils.h"
+ #include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
+ #include "third_party/blink/renderer/platform/graphics/image.h"
++#include "third_party/blink/renderer/platform/graphics/image_data_buffer.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image_transform.h"
+ #include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
+@@ -472,7 +473,8 @@ ScriptPromise<Blob> OffscreenCanvas::convertToBlob(
+   }
+ 
+   base::TimeTicks start_time = base::TimeTicks::Now();
+-  scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
++  scoped_refptr<StaticBitmapImage> image_bitmap =
++      ImageDataBuffer::CreateCanvasSnapshot(context_->GetImage());
+   if (image_bitmap) {
+     auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<Blob>>(
+         script_state, exception_state.GetContext());
+@@ -762,8 +764,10 @@ UniqueFontSelector* OffscreenCanvas::GetFontSelector() {
+     return unique_font_selector;
+   }
+   FontSelector* base_selector = nullptr;
+-  if (auto* window = DynamicTo<LocalDOMWindow>(GetExecutionContext())) {
+-    base_selector = window->document()->GetStyleEngine().GetFontSelector();
++  if (IsA<LocalDOMWindow>(GetExecutionContext())) {
++    // Iris: 窗口侧离屏画布与 worker 共用独立字体选择器（空 generic 设置），
++    // 泛型族名回退到平台默认字体，与参考引擎一致。
++    base_selector = MakeGarbageCollected<OffscreenFontSelector>(nullptr);
+   } else {
+     // TODO(crbug.com/40059901): Temporary mitigation.  Remove the following
+     // CHECK once a more comprehensive solution has been implemented.
+diff --git third_party/blink/renderer/platform/BUILD.gn third_party/blink/renderer/platform/BUILD.gn
+index 40c9e58d911ba8031c8c6afa6ba336922073067c..fe250513cd2419abe1de8440d8475c3fc35d8a9b 100644
+--- third_party/blink/renderer/platform/BUILD.gn
++++ third_party/blink/renderer/platform/BUILD.gn
+@@ -1839,6 +1839,8 @@ component("platform") {
+   deps = [
+     ":font_format_check",
+     ":rustfft_ffi",
++    "//components/iris",
++    "//components/iris:skia_pixels",
+     "//base:base_static",
+     "//base/allocator:buildflags",
+     "//build:chromecast_buildflags",
+diff --git third_party/blink/renderer/platform/graphics/image_data_buffer.cc third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index c76f6553e1cec3e66ee4f4435bdda02fb044e57f..5fc4883c4bfbccbd4b032f01b6af1b522c8591d0 100644
+--- third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -34,6 +34,9 @@
+ 
+ #include "base/compiler_specific.h"
+ #include "base/memory/ptr_util.h"
++#include "components/iris/profile.h"
++#include "components/iris/skia_pixels.h"
++#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+@@ -43,10 +46,8 @@
+ 
+ namespace blink {
+ 
+-ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+-  if (!image)
+-    return;
+-  PaintImage paint_image = image->PaintImageForCurrentFrame();
++ImageDataBuffer::ImageDataBuffer(const PaintImage& paint_image,
++                                uint64_t canvas_seed) {
+   if (!paint_image || paint_image.IsPaintWorklet())
+     return;
+ 
+@@ -63,7 +64,8 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+   }
+ #endif
+ 
+-  if (paint_image.IsTextureBacked() || paint_image.IsLazyGenerated() ||
++  if (canvas_seed != 0 || paint_image.IsTextureBacked() ||
++      paint_image.IsLazyGenerated() ||
+       paint_image_info.alphaType() != kUnpremul_SkAlphaType) {
+     // Unpremul is handled upfront, using readPixels, which will correctly clamp
+     // premul color values that would otherwise cause overflows in the skia
+@@ -72,9 +74,14 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+     if (colorType == kRGBA_8888_SkColorType ||
+         colorType == kBGRA_8888_SkColorType)
+       colorType = kN32_SkColorType;  // Work around for bug with JPEG encoder
++    // 不透明源保持 opaque：alpha:false 的 WebGL 画布序列化为无 alpha PNG。
++    const SkAlphaType alpha_type =
++        paint_image_info.alphaType() == kOpaque_SkAlphaType
++            ? kOpaque_SkAlphaType
++            : kUnpremul_SkAlphaType;
+     const SkImageInfo info =
+         SkImageInfo::Make(paint_image_info.width(), paint_image_info.height(),
+-                          paint_image_info.colorType(), kUnpremul_SkAlphaType,
++                          colorType, alpha_type,
+                           paint_image_info.refColorSpace());
+     const size_t rowBytes = info.minRowBytes();
+     size_t size = info.computeByteSize(rowBytes);
+@@ -82,6 +89,8 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+       return;
+ 
+     sk_sp<SkData> data = SkData::MakeUninitialized(size);
++    if (!data)
++      return;
+     pixmap_ = {info, data->writable_data(), info.minRowBytes()};
+     if (!paint_image.readPixels(info, pixmap_.writable_addr(), rowBytes, 0,
+                                 0)) {
+@@ -89,6 +98,8 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+       return;
+     }
+     MSAN_CHECK_MEM_IS_INITIALIZED(pixmap_.addr(), pixmap_.computeByteSize());
++    if (canvas_seed != 0)
++      iris::PerturbSkPixmap(pixmap_, canvas_seed);
+     retained_image_ = SkImages::RasterFromData(info, std::move(data), rowBytes);
+   } else {
+     retained_image_ = paint_image.GetSwSkImage();
+@@ -106,8 +117,10 @@ ImageDataBuffer::ImageDataBuffer(const SkPixmap& pixmap)
+ 
+ std::unique_ptr<ImageDataBuffer> ImageDataBuffer::Create(
+     scoped_refptr<StaticBitmapImage> image) {
++  if (!image)
++    return nullptr;
+   std::unique_ptr<ImageDataBuffer> buffer =
+-      base::WrapUnique(new ImageDataBuffer(image));
++      base::WrapUnique(new ImageDataBuffer(image->PaintImageForCurrentFrame(), 0));
+   if (!buffer->IsValid())
+     return nullptr;
+   return buffer;
+@@ -127,6 +140,30 @@ base::span<const uint8_t> ImageDataBuffer::PixelData() const {
+   return gfx::SkPixmapToSpan(pixmap_);
+ }
+ 
++scoped_refptr<StaticBitmapImage> ImageDataBuffer::CreateCanvasSnapshot(
++    scoped_refptr<StaticBitmapImage> image) {
++  if (!image)
++    return nullptr;
++  const uint64_t canvas_seed = iris::GetRuntimeConfig().canvas_seed;
++  if (canvas_seed == 0)
++    return image;
++  const PaintImage paint_image = image->PaintImageForCurrentFrame();
++  if (!paint_image || paint_image.IsPaintWorklet())
++    return nullptr;
++  const SkColorType type = paint_image.GetColorType();
++  if (type != kRGBA_8888_SkColorType && type != kRGB_888x_SkColorType &&
++      type != kBGRA_8888_SkColorType)
++    return image;
++  ImageDataBuffer buffer(paint_image, canvas_seed);
++  if (!buffer.IsValid() || !buffer.retained_image_)
++    return nullptr;
++  auto snapshot = UnacceleratedStaticBitmapImage::Create(
++      std::move(buffer.retained_image_), image->Orientation(),
++      paint_image.GetHDRMetadata());
++  snapshot->SetOriginClean(image->OriginClean());
++  return snapshot;
++}
++
+ bool ImageDataBuffer::EncodeImage(const ImageEncodingMimeType mime_type,
+                                   const double& quality,
+                                   Vector<unsigned char>* encoded_image) const {
+diff --git third_party/blink/renderer/platform/graphics/image_data_buffer.h third_party/blink/renderer/platform/graphics/image_data_buffer.h
+index 7788473df7e915a0f5d53b7c134cf1ad8177582e..c0591ba6dbb758e190cd18e9054c35d4f77edc2a 100644
+--- third_party/blink/renderer/platform/graphics/image_data_buffer.h
++++ third_party/blink/renderer/platform/graphics/image_data_buffer.h
+@@ -28,6 +28,7 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_IMAGE_DATA_BUFFER_H_
+ #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_IMAGE_DATA_BUFFER_H_
+ 
++#include <cstdint>
+ #include <memory>
+ 
+ #include "base/containers/span.h"
+@@ -51,6 +52,11 @@ class PLATFORM_EXPORT ImageDataBuffer {
+       scoped_refptr<StaticBitmapImage>);
+   static std::unique_ptr<ImageDataBuffer> Create(const SkPixmap&);
+ 
++  // 仅供画布编码导出使用；需要扰动时创建独占的 unpremul 副本。
++  // 不支持的格式及禁用扰动时保留原图，不改变共享像素或渲染快照。
++  static scoped_refptr<StaticBitmapImage> CreateCanvasSnapshot(
++      scoped_refptr<StaticBitmapImage>);
++
+   String ToDataURL(const ImageEncodingMimeType mime_type,
+                    const double& quality) const;
+   bool EncodeImage(const ImageEncodingMimeType mime_type,
+@@ -61,7 +67,7 @@ class PLATFORM_EXPORT ImageDataBuffer {
+ 
+  private:
+   ImageDataBuffer(const SkPixmap&);
+-  ImageDataBuffer(scoped_refptr<StaticBitmapImage>);
++  ImageDataBuffer(const PaintImage&, uint64_t canvas_seed);
+ 
+   bool IsValid() { return is_valid_; }  // Only used by Create()
+ 

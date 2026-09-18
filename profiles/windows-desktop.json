@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "profile_version": 2,
+  "id": "windows-desktop",
+  "platform": "Win32",
+  "user_agent": {
+    "platform": "Windows",
+    "platform_version": "10.0.0",
+    "architecture": "x86",
+    "bitness": "64",
+    "mobile": false,
+    "wow64": false
+  },
+  "languages": ["en-US", "en"],
+  "hardware_concurrency": 12,
+  "device_memory": 8,
+  "device_memory_header": 32,
+  "max_touch_points": 10,
+  "prefers_reduced_motion": false,
+  "storage_quota": 651719826624,
+  "connection": {
+    "effective_type": "4g",
+    "rtt_ms": 200,
+    "downlink_mbps": 2.8,
+    "save_data": false
+  },
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "available_width": 1920,
+    "available_height": 1040,
+    "device_scale_factor": 1,
+    "color_depth": 32,
+    "pixel_depth": 32,
+    "depth_per_component": 8,
+    "orientation": "landscape-primary",
+    "viewport_width": 1920,
+    "viewport_height": 1080,
+    "inner_width": 1920,
+    "inner_height": 955,
+    "outer_width": 1920,
+    "outer_height": 1040
+  },
+  "webgl": {
+    "vendor": "Google Inc. (NVIDIA)",
+    "renderer": "ANGLE (NVIDIA, NVIDIA RTX A4000 (0x24b0) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+  },
+  "webgpu": {
+    "vendor": "nvidia",
+    "architecture": "",
+    "device": "",
+    "description": "",
+    "features": ["depth32float-stencil8", "rg11b10ufloat-renderable", "bgra8unorm-storage", "depth-clip-control", "texture-compression-bc", "shader-f16", "timestamp-query", "float32-filterable", "indirect-first-instance"]
+  },
+  "fonts": ["Arial", "Arial Black", "Bahnschrift", "Calibri", "Cambria", "Cambria Math", "Cascadia Code", "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New", "Franklin Gothic", "Franklin Gothic Medium", "Gabriola", "Gadugi", "Georgia", "Impact", "Ink Free", "Leelawadee UI", "Lucida Console", "Lucida Sans Unicode", "Malgun Gothic", "Marlett", "Microsoft Sans Serif", "Microsoft YaHei", "MS Gothic", "MS PGothic", "MS UI Gothic", "Nirmala UI", "Palatino Linotype", "Segoe UI", "Segoe UI Emoji", "Segoe UI Light", "Segoe UI Symbol", "SimSun", "Symbol", "Tahoma", "Times New Roman", "Trebuchet MS", "Verdana", "Webdings", "Yu Gothic"],
+  "generic_fonts": {
+    "standard": "Times New Roman",
+    "serif": "Times New Roman",
+    "sans_serif": "Arial",
+    "monospace": "Consolas",
+    "cursive": "Comic Sans MS",
+    "fantasy": "Impact",
+    "math": "Cambria Math"
+  },
+  "audio_sample_rate": 48000
+}

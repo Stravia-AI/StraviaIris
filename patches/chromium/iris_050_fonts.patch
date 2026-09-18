@@ -1,0 +1,915 @@
+目的：固定字体画像及枚举顺序，保持原生匹配与自定义字体；local-fonts 按参考查询和权限结果语义返回画像
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：DOM、Canvas、worker 与 FontAccess 字体画像一致；local-fonts 拒绝仍可枚举，初次无激活及帧策略限制仍拒绝；其他权限不变
+
+diff --git content/browser/font_access/font_access_manager.cc content/browser/font_access/font_access_manager.cc
+index 8b0e907a3017e24e3c8c5a8b802b7fa440025ec1..bcd302506e07cd6513ef782df63b3a3d39c8a5f9 100644
+--- content/browser/font_access/font_access_manager.cc
++++ content/browser/font_access/font_access_manager.cc
+@@ -14,6 +14,7 @@
+ #include "base/sequence_checker.h"
+ #include "base/task/thread_pool.h"
+ #include "base/types/pass_key.h"
++#include "build/build_config.h"
+ #include "content/browser/font_access/font_enumeration_cache.h"
+ #include "content/browser/font_access/font_enumeration_data_source.h"
+ #include "content/browser/renderer_host/frame_tree_node.h"
+@@ -153,15 +154,18 @@ void FontAccessManager::DidRequestPermission(
+     PermissionResult permission_result) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
++  // The Windows reference profile exposes its fixed list after either
++  // permission decision. Visibility and initial activation checks still apply.
++#if !BUILDFLAG(IS_WIN)
+   if (permission_result.status != blink::mojom::PermissionStatus::GRANTED) {
+     std::move(callback).Run(
+         blink::mojom::FontEnumerationStatus::kPermissionDenied,
+         base::ReadOnlySharedMemoryRegion());
+     return;
+   }
++#endif  // !BUILDFLAG(IS_WIN)
+ 
+-  // Per-platform delegation for obtaining cached font enumeration data occurs
+-  // here, after the permission has been granted.
++  // The data source supplies the fixed Windows profile, not host enumeration.
+   font_enumeration_cache_
+       .AsyncCall(&FontEnumerationCache::GetFontEnumerationData)
+       .Then(base::BindOnce(
+diff --git content/browser/font_access/font_access_manager_unittest.cc content/browser/font_access/font_access_manager_unittest.cc
+index 5862d7ba1a81f2256b88cce4ecfd47e956ff11d3..0c120c4dea22f5be106a419ca19112485b5a76d1 100644
+--- content/browser/font_access/font_access_manager_unittest.cc
++++ content/browser/font_access/font_access_manager_unittest.cc
+@@ -13,11 +13,13 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/read_only_shared_memory_region.h"
+ #include "base/run_loop.h"
++#include "base/strings/string_util.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "base/test/bind.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "base/threading/sequence_bound.h"
++#include "build/build_config.h"
+ #include "content/browser/font_access/font_access_test_utils.h"
+ #include "content/browser/font_access/font_enumeration_cache.h"
+ #include "content/browser/font_access/font_enumeration_data_source.h"
+@@ -187,7 +189,7 @@ class FontAccessManagerTest : public RenderViewHostImplTestHarness {
+ namespace {
+ 
+ void ValidateFontEnumerationBasic(FontEnumerationStatus status,
+-                                  base::ReadOnlySharedMemoryRegion region) {
++                                  const base::ReadOnlySharedMemoryRegion& region) {
+   ASSERT_EQ(status, FontEnumerationStatus::kOk) << "enumeration status is kOk";
+ 
+   base::ReadOnlySharedMemoryMapping mapping = region.Map();
+@@ -204,8 +206,14 @@ void ValidateFontEnumerationBasic(FontEnumerationStatus status,
+     EXPECT_GT(font.style().size(), 0ULL) << "style size is not zero.";
+ 
+     if (previous_font.IsInitialized()) {
++#if BUILDFLAG(IS_WIN)
++      EXPECT_LT(base::CompareCaseInsensitiveASCII(
++                    previous_font.postscript_name(), font.postscript_name()),
++                0);
++#else
+       EXPECT_LT(previous_font.postscript_name(), font.postscript_name())
+           << "font list is sorted";
++#endif
+     }
+ 
+     previous_font = font;
+@@ -252,7 +260,7 @@ TEST_F(FontAccessManagerTest, PreviouslyGrantedValidateEnumerationBasic) {
+   auto [status, region] = manager_sync_->EnumerateLocalFonts();
+   if (FontEnumerationDataSource::IsOsSupported()) {
+     EXPECT_EQ(status, FontEnumerationStatus::kOk);
+-    ValidateFontEnumerationBasic(std::move(status), std::move(region));
++    ValidateFontEnumerationBasic(status, region);
+   } else {
+     EXPECT_EQ(status, FontEnumerationStatus::kUnimplemented);
+   }
+@@ -277,20 +285,27 @@ TEST_F(FontAccessManagerTest, EnumerationFailsIfNoActivation) {
+   EXPECT_EQ(status, FontEnumerationStatus::kNeedsUserActivation);
+ }
+ 
+-TEST_F(FontAccessManagerTest, PermissionDeniedOnAskErrors) {
++TEST_F(FontAccessManagerTest, PermissionDeniedOnAsk) {
+   AskDenyPermission();
+   SimulateUserActivation();
+ 
+   const auto [status, region] = manager_sync_->EnumerateLocalFonts();
++#if BUILDFLAG(IS_WIN)
++  ValidateFontEnumerationBasic(status, region);
++#else
+   EXPECT_EQ(status, FontEnumerationStatus::kPermissionDenied);
++#endif
+ }
+ 
+-TEST_F(FontAccessManagerTest, PermissionPreviouslyDeniedErrors) {
++TEST_F(FontAccessManagerTest, PermissionPreviouslyDeniedWithoutActivation) {
+   AutoDenyPermission();
+-  SimulateUserActivation();
+ 
+   const auto [status, region] = manager_sync_->EnumerateLocalFonts();
++#if BUILDFLAG(IS_WIN)
++  ValidateFontEnumerationBasic(status, region);
++#else
+   EXPECT_EQ(status, FontEnumerationStatus::kPermissionDenied);
++#endif
+ }
+ 
+ }  // namespace
+diff --git content/browser/font_access/font_enumeration_cache.cc content/browser/font_access/font_enumeration_cache.cc
+index cca4fdb01dc618f795e6c8d9f897565399146f3c..5b0e334734fa49152c9267712efbe781cbe8bbf0 100644
+--- content/browser/font_access/font_enumeration_cache.cc
++++ content/browser/font_access/font_enumeration_cache.cc
+@@ -19,6 +19,7 @@
+ #include "base/task/thread_pool.h"
+ #include "base/threading/sequence_bound.h"
+ #include "base/types/pass_key.h"
++#include "build/build_config.h"
+ #include "content/browser/font_access/font_enumeration_data_source.h"
+ #include "third_party/blink/public/common/font_access/font_enumeration_table.pb.h"
+ #include "third_party/blink/public/mojom/font_access/font_access.mojom.h"
+@@ -84,6 +85,8 @@ void FontEnumerationCache::BuildEnumerationCache(
+     return;
+   }
+ 
++  // The Windows source already supplies the fixed profile's deterministic order.
++#if !BUILDFLAG(IS_WIN)
+   // Postscript names, according to spec, are expected to be encoded in a subset
+   // of ASCII. See:
+   // https://docs.microsoft.com/en-us/typography/opentype/spec/name This is why
+@@ -93,6 +96,7 @@ void FontEnumerationCache::BuildEnumerationCache(
+                const blink::FontEnumerationTable_FontData& b) {
+               return a.postscript_name() < b.postscript_name();
+             });
++#endif
+ 
+   base::MappedReadOnlyRegion font_data_region =
+       base::ReadOnlySharedMemoryRegion::Create(table.ByteSizeLong());
+diff --git content/browser/font_access/font_enumeration_data_source_win.cc content/browser/font_access/font_enumeration_data_source_win.cc
+index dbcb693ab91e965deb82268d171803710e124137..ba0ce2c8b66b5c4302ff0872f44f4583ffbd3774 100644
+--- content/browser/font_access/font_enumeration_data_source_win.cc
++++ content/browser/font_access/font_enumeration_data_source_win.cc
+@@ -4,173 +4,13 @@
+ 
+ #include "content/browser/font_access/font_enumeration_data_source_win.h"
+ 
+-#include <dwrite.h>
+-#include <stdint.h>
+-#include <wrl/client.h>
+-
+-#include <optional>
+ #include <string>
++#include <utility>
+ 
+-#include "base/location.h"
+-#include "base/notreached.h"
+-#include "base/sequence_checker.h"
+-#include "base/threading/scoped_blocking_call.h"
+-#include "content/browser/font_access/font_enumeration_cache.h"
+-#include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
+-#include "third_party/blink/public/common/font_access/font_enumeration_table.pb.h"
+-#include "ui/gfx/win/direct_write.h"
++#include "components/iris/profile_data.h"
+ 
+ namespace content {
+ 
+-namespace {
+-
+-// Retrieves a DirectWrite font collection for all fonts on the system.
+-//
+-// This operation may be expensive, and its result should be cached.
+-//
+-// Returns nullptr in case of failure.
+-Microsoft::WRL::ComPtr<IDWriteFontCollection> GetSystemFonts() {
+-  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+-                                                base::BlockingType::MAY_BLOCK);
+-  // Returned from all code paths, to enable return value optimization.
+-  Microsoft::WRL::ComPtr<IDWriteFontCollection> collection = nullptr;
+-
+-  Microsoft::WRL::ComPtr<IDWriteFactory> factory;
+-  gfx::win::CreateDWriteFactory(&factory);
+-  if (!factory)
+-    return collection;
+-
+-  HRESULT hr = factory->GetSystemFontCollection(&collection);
+-  if (FAILED(hr))
+-    collection = nullptr;
+-
+-  return collection;
+-}
+-
+-// Retrieves a string from a font's information table.
+-//
+-// Returns nullptr in case of failure.
+-Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> GetFontInformation(
+-    IDWriteFont* font,
+-    DWRITE_INFORMATIONAL_STRING_ID string_id) {
+-  base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+-                                                base::BlockingType::MAY_BLOCK);
+-
+-  // Returned from all code paths, to enable return value optimization.
+-  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> localized_strings;
+-  BOOL font_has_info;
+-
+-  HRESULT hr = font->GetInformationalStrings(string_id, &localized_strings,
+-                                             &font_has_info);
+-  if (FAILED(hr) || !font_has_info)
+-    localized_strings = nullptr;
+-
+-  return localized_strings;
+-}
+-
+-// Retrieves a string matching a locale from a DirectWrite string collection.
+-//
+-// If a string in the given locale does not exist, falls back to retrieving the
+-// first string in the collection.
+-//
+-// Returns nullopt in case the string does not exist.
+-std::optional<std::string> GetLocalizedString(IDWriteLocalizedStrings* names,
+-                                              const std::string& locale) {
+-  std::optional<std::string> localized_name =
+-      gfx::win::RetrieveLocalizedString(names, locale);
+-  if (!localized_name.has_value()) {
+-    // Fall back to returning the first string in the collection.
+-    localized_name = gfx::win::RetrieveLocalizedString(names, std::string());
+-  }
+-  return localized_name;
+-}
+-
+-// Retrieves a font family name that can be reported by the Fonts Access API.
+-//
+-// Returns nullopt in case of failure.
+-std::optional<std::string> GetFamilyName(IDWriteFontFamily* family) {
+-  std::optional<std::string> family_name;
+-
+-  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> family_names;
+-  HRESULT hr = family->GetFamilyNames(&family_names);
+-  if (FAILED(hr))
+-    return family_name;
+-
+-  family_name = GetLocalizedString(family_names.Get(), "en-us");
+-  return family_name;
+-}
+-
+-// Retrieves a font's PostScript name, to be reported by the Fonts Access API.
+-//
+-// Returns nullopt in case of failure.
+-std::optional<std::string> GetFontPostScriptName(IDWriteFont* font) {
+-  std::optional<std::string> postscript_name;
+-
+-  // DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME and
+-  // DWRITE_INFORMATIONAL_STRING_FULL_NAME are only supported on Windows 7 with
+-  // KB2670838 (https://support.microsoft.com/en-us/kb/2670838) installed. It is
+-  // possible to use a fallback as can be observed in Firefox:
+-  // https://bugzilla.mozilla.org/show_bug.cgi?id=947812 However, this might not
+-  // be worth the effort.
+-
+-  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> postscript_names =
+-      GetFontInformation(font, DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME);
+-  if (!postscript_names)
+-    return postscript_name;
+-
+-  postscript_name = GetLocalizedString(postscript_names.Get(), "en-us");
+-  return postscript_name;
+-}
+-
+-// Retrieves a font's full name, to be reported by the Fonts Access API.
+-//
+-// Returns nullopt in case of failure.
+-std::optional<std::string> GetFontFullName(IDWriteFont* font,
+-                                           const std::string& locale) {
+-  std::optional<std::string> full_name;
+-
+-  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> full_names =
+-      GetFontInformation(font, DWRITE_INFORMATIONAL_STRING_FULL_NAME);
+-  if (!full_names)
+-    return full_name;
+-
+-  full_name = GetLocalizedString(full_names.Get(), locale);
+-  return full_name;
+-}
+-
+-// Returns a font's style name, to be reported by the Fonts Access API.
+-//
+-// Returns nullopt in case of failure.
+-std::optional<std::string> GetFontStyleName(IDWriteFont* font) {
+-  std::optional<std::string> style_name;
+-
+-  // All fonts should have a subfamily name compatible with Windows GDI,
+-  // available as the string DWRITE_INFORMATIONAL_STRING_WIN32_SUBFAMILY_NAMES.
+-  //
+-  // In some cases, the family / sub-family names preferred by designer wouldn't
+-  // be compatible with Windows GDI, and the desiner. In these cases, the
+-  // designer-preferred subfamily name is availabe as the string
+-  // DWRITE_INFORMATIONAL_STRING_PREFERRED_SUBFAMILY_NAMES.
+-  //
+-  // More details at
+-  // https://docs.microsoft.com/en-us/windows/win32/api/dwrite/ne-dwrite-dwrite_informational_string_id
+-
+-  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> style_names =
+-      GetFontInformation(font,
+-                         DWRITE_INFORMATIONAL_STRING_PREFERRED_SUBFAMILY_NAMES);
+-  if (!style_names) {
+-    style_names = GetFontInformation(
+-        font, DWRITE_INFORMATIONAL_STRING_WIN32_SUBFAMILY_NAMES);
+-    if (!style_names)
+-      return style_name;
+-  }
+-
+-  style_name = GetLocalizedString(style_names.Get(), "en-us");
+-  return style_name;
+-}
+-
+-}  // namespace
+-
+ FontEnumerationDataSourceWin::FontEnumerationDataSourceWin() {
+   DETACH_FROM_SEQUENCE(sequence_checker_);
+ }
+@@ -180,77 +20,24 @@ FontEnumerationDataSourceWin::~FontEnumerationDataSourceWin() {
+ }
+ 
+ blink::FontEnumerationTable FontEnumerationDataSourceWin::GetFonts(
+-    const std::string& locale) {
++    const std::string&) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+-  blink::FontEnumerationTable font_enumeration_table;
+-
+-  Microsoft::WRL::ComPtr<IDWriteFontCollection> collection = GetSystemFonts();
+-  uint32_t family_count;
+-  {
+-    base::ScopedBlockingCall scoped_blocking_call(
+-        FROM_HERE, base::BlockingType::MAY_BLOCK);
+-
+-    family_count = collection->GetFontFamilyCount();
++  // 可见性和首次询问权限时的用户激活检查保留在 FontAccessManager。枚举记录只是 profile
++  // 身份；blob() 继续按真实唯一名称读取，名称不存在时保留原生错误。
++  blink::FontEnumerationTable table;
++  table.mutable_fonts()->Reserve(
++      static_cast<int>(iris::profile::kFontFamilies.size()));
++  for (std::string_view family : iris::profile::kFontFamilies) {
++    std::string postscript_name(family);
++    std::erase(postscript_name, ' ');
++    auto* data = table.add_fonts();
++    data->set_postscript_name(std::move(postscript_name));
++    data->set_full_name(family.data(), family.size());
++    data->set_family(family.data(), family.size());
++    data->set_style("Regular");
+   }
+-
+-  // Used to filter duplicates.
+-  absl::flat_hash_set<std::string> fonts_seen;
+-
+-  for (uint32_t family_index = 0; family_index < family_count; ++family_index) {
+-    Microsoft::WRL::ComPtr<IDWriteFontFamily> family;
+-    HRESULT hr = collection->GetFontFamily(family_index, &family);
+-    if (FAILED(hr))
+-      continue;
+-
+-    std::optional<std::string> family_name = GetFamilyName(family.Get());
+-
+-    uint32_t font_count = family->GetFontCount();
+-    for (uint32_t font_index = 0; font_index < font_count; ++font_index) {
+-      Microsoft::WRL::ComPtr<IDWriteFont> font;
+-      {
+-        base::ScopedBlockingCall scoped_blocking_call(
+-            FROM_HERE, base::BlockingType::MAY_BLOCK);
+-        hr = family->GetFont(font_index, &font);
+-      }
+-
+-      if (FAILED(hr))
+-        continue;
+-
+-      // Skip this font if it's a simulation.
+-      if (font->GetSimulations() != DWRITE_FONT_SIMULATIONS_NONE)
+-        continue;
+-
+-      std::optional<std::string> postscript_name =
+-          GetFontPostScriptName(font.Get());
+-      if (!postscript_name)
+-        continue;
+-
+-      bool success = fonts_seen.emplace(*postscript_name).second;
+-      if (!success) {
+-        // Skip duplicates.
+-        continue;
+-      }
+-
+-      std::optional<std::string> localized_full_name =
+-          GetFontFullName(font.Get(), locale);
+-      if (!localized_full_name)
+-        localized_full_name = postscript_name;
+-
+-      std::optional<std::string> style_name = GetFontStyleName(font.Get());
+-      if (!style_name)
+-        continue;
+-
+-      blink::FontEnumerationTable_FontData* data =
+-          font_enumeration_table.add_fonts();
+-      data->set_postscript_name(*std::move(postscript_name));
+-      data->set_full_name(*std::move(localized_full_name));
+-      data->set_family(*family_name);
+-      data->set_style(*std::move(style_name));
+-    }
+-  }
+-
+-  return font_enumeration_table;
++  return table;
+ }
+ 
+ }  // namespace content
+diff --git content/browser/font_access/font_enumeration_data_source_win.h content/browser/font_access/font_enumeration_data_source_win.h
+index a72866d880d02ba1541f6b44f2912796e3db58e6..e151e831eec9e25d89c20caea9462a62a00765a6 100644
+--- content/browser/font_access/font_enumeration_data_source_win.h
++++ content/browser/font_access/font_enumeration_data_source_win.h
+@@ -15,7 +15,7 @@ namespace content {
+ 
+ // Windows implementation of FontEnumerationDataSource.
+ //
+-// Calls DirectWrite font APIs. Requires Windows 7 with KB2670838 and newer.
++// 提供 profile 枚举身份；授权检查及字体二进制读取由原有调用链负责。
+ class FontEnumerationDataSourceWin : public FontEnumerationDataSource {
+  public:
+   FontEnumerationDataSourceWin();
+diff --git third_party/blink/renderer/core/css/css_font_selector.cc third_party/blink/renderer/core/css/css_font_selector.cc
+index 2af99788e1c52161bdf4906d112ae04af1554eed..fe28cb07e5713c8b042dbaf89d3947763c109d38 100644
+--- third_party/blink/renderer/core/css/css_font_selector.cc
++++ third_party/blink/renderer/core/css/css_font_selector.cc
+@@ -39,6 +39,7 @@
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/platform/font_family_names.h"
+ #include "third_party/blink/renderer/platform/fonts/font_cache.h"
+ #include "third_party/blink/renderer/platform/fonts/font_selector_client.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+@@ -111,6 +112,63 @@ scoped_refptr<const FontPalette> ResolveInterpolableFontPalette(
+ 
+ }  // namespace
+ 
++// Canvas 与 DOM 共享字体加载、页面设置和失效通知，但不共享泛型回退
++// 策略。每个 CSS 选择器只创建一个适配器，Canvas 复用其 fallback map。
++class CSSFontSelector::CanvasFontSelector final : public FontSelector {
++ public:
++  explicit CanvasFontSelector(CSSFontSelector* selector) : selector_(selector) {}
++
++  const FontData* GetFontData(const FontDescription& description,
++                              const FontFamily& family) override {
++    return selector_->GetFontDataInternal(description, family, true);
++  }
++  void WillUseFontData(const FontDescription& description,
++                       const FontFamily& family,
++                       const String& text) override {
++    selector_->WillUseFontData(description, family, text);
++  }
++  void WillUseRange(const FontDescription& description,
++                    const AtomicString& family,
++                    const FontDataForRangeSet& range) override {
++    selector_->WillUseRange(description, family, range);
++  }
++  void ReportNotDefGlyph() const override { selector_->ReportNotDefGlyph(); }
++  void RegisterForInvalidationCallbacks(FontSelectorClient* client) override {
++    selector_->RegisterForInvalidationCallbacks(client);
++  }
++  void UnregisterForInvalidationCallbacks(FontSelectorClient* client) override {
++    selector_->UnregisterForInvalidationCallbacks(client);
++  }
++  void FontFaceInvalidated(FontInvalidationReason reason) override {
++    selector_->FontFaceInvalidated(reason);
++  }
++  void FontCacheInvalidated() override { selector_->FontCacheInvalidated(); }
++  ExecutionContext* GetExecutionContext() const override {
++    return selector_->GetExecutionContext();
++  }
++  FontFaceCache* GetFontFaceCache() override {
++    return selector_->GetFontFaceCache();
++  }
++  bool IsPlatformFamilyMatchAvailable(const FontDescription& description,
++                                      const FontFamily& family) override {
++    return selector_->IsPlatformFamilyMatchAvailable(description, family);
++  }
++  void Trace(Visitor* visitor) const override {
++    visitor->Trace(selector_);
++    FontSelector::Trace(visitor);
++  }
++
++ private:
++  Member<CSSFontSelector> selector_;
++};
++
++FontSelector* CSSFontSelector::GetCanvasFontSelector() {
++  if (!canvas_selector_) {
++    canvas_selector_ = MakeGarbageCollected<CanvasFontSelector>(this);
++  }
++  return canvas_selector_.Get();
++}
++
+ CSSFontSelector::CSSFontSelector(const TreeScope& tree_scope)
+     : tree_scope_(&tree_scope) {
+   DCHECK(tree_scope.GetDocument().GetExecutionContext()->IsContextThread());
+@@ -166,7 +224,22 @@ void CSSFontSelector::FontCacheInvalidated() {
+ const FontData* CSSFontSelector::GetFontData(
+     const FontDescription& font_description,
+     const FontFamily& font_family) {
++  return GetFontDataInternal(font_description, font_family, false);
++}
++
++const FontData* CSSFontSelector::GetFontDataInternal(
++    const FontDescription& font_description,
++    const FontFamily& font_family,
++    bool for_canvas) {
+   const auto& family_name = font_family.FamilyName();
++  if (!for_canvas && font_family.FamilyIsGeneric() &&
++      (family_name == font_family_names::kSerif ||
++       family_name == font_family_names::kSansSerif ||
++       family_name == font_family_names::kMonospace ||
++       family_name == font_family_names::kCursive ||
++       family_name == font_family_names::kWebkitStandard)) {
++    return nullptr;
++  }
+   Document& document = GetTreeScope()->GetDocument();
+ 
+   FontDescription request_description(font_description);
+@@ -241,6 +314,9 @@ const FontData* CSSFontSelector::GetFontData(
+             font_face_cache_->Get(request_description, family_name)) {
+       return face->GetFontData(request_description);
+     }
++    if (!IsIrisFontFamilyAllowed(family_name)) {
++      return nullptr;
++    }
+   }
+ 
+   // Try to return the correct font based off our settings, in case we were
+@@ -282,6 +358,7 @@ bool CSSFontSelector::IsAlive() const {
+ }
+ 
+ void CSSFontSelector::Trace(Visitor* visitor) const {
++  visitor->Trace(canvas_selector_);
+   visitor->Trace(tree_scope_);
+   visitor->Trace(clients_);
+   CSSFontSelectorBase::Trace(visitor);
+diff --git third_party/blink/renderer/core/css/css_font_selector.h third_party/blink/renderer/core/css/css_font_selector.h
+index c31c8f8283514817d80632c3400843c6264a2167..2b6bf1c8e76365370ea41a001700b3a96f1aea25 100644
+--- third_party/blink/renderer/core/css/css_font_selector.h
++++ third_party/blink/renderer/core/css/css_font_selector.h
+@@ -49,6 +49,7 @@ class CORE_EXPORT CSSFontSelector : public CSSFontSelectorBase {
+ 
+   const FontData* GetFontData(const FontDescription&,
+                               const FontFamily&) override;
++  FontSelector* GetCanvasFontSelector() override;
+ 
+   void FontFaceInvalidated(FontInvalidationReason) override;
+ 
+@@ -84,6 +85,12 @@ class CORE_EXPORT CSSFontSelector : public CSSFontSelectorBase {
+   UseCounter* GetUseCounter() const override;
+ 
+  private:
++  class CanvasFontSelector;
++  const FontData* GetFontDataInternal(const FontDescription&,
++                                      const FontFamily&,
++                                      bool for_canvas);
++  Member<CanvasFontSelector> canvas_selector_;
++
+   // TODO(Oilpan): Ideally this should just be a traced Member but that will
+   // currently leak because ComputedStyle and its data are not on the heap.
+   // See crbug.com/383860 for details.
+diff --git third_party/blink/renderer/core/css/css_font_selector_base.cc third_party/blink/renderer/core/css/css_font_selector_base.cc
+index 65b35128ff752f9ed1151166587c671cdddbbcab..5ff91c9fa13ca3529d78538b2ee4575b1d40a8a4 100644
+--- third_party/blink/renderer/core/css/css_font_selector_base.cc
++++ third_party/blink/renderer/core/css/css_font_selector_base.cc
+@@ -26,6 +26,10 @@ AtomicString CSSFontSelectorBase::FamilyNameFromSettings(
+ bool CSSFontSelectorBase::IsPlatformFamilyMatchAvailable(
+     const FontDescription& font_description,
+     const FontFamily& passed_family) {
++  if (!passed_family.FamilyIsGeneric() &&
++      !IsIrisFontFamilyAllowed(passed_family.FamilyName())) {
++    return false;
++  }
+   AtomicString family = FamilyNameFromSettings(font_description, passed_family);
+   if (family.empty()) {
+     family = passed_family.FamilyName();
+@@ -83,6 +87,9 @@ void CSSFontSelectorBase::WillUseFontData(
+   if (family.FamilyName().empty()) [[unlikely]] {
+     return;
+   }
++  if (!IsIrisFontFamilyAllowed(family.FamilyName())) {
++    return;
++  }
+   family.SetIsPrewarmed();
+   FontCache::PrewarmFamily(family.FamilyName());
+ }
+diff --git third_party/blink/renderer/core/css/local_font_face_source.cc third_party/blink/renderer/core/css/local_font_face_source.cc
+index ab4e6a9bedfed3f638920641bd58b0a2f3b0e15f..7be1d99373a3b58c2e689f2285975b1a3dedaae4 100644
+--- third_party/blink/renderer/core/css/local_font_face_source.cc
++++ third_party/blink/renderer/core/css/local_font_face_source.cc
+@@ -27,11 +27,15 @@ LocalFontFaceSource::LocalFontFaceSource(CSSFontFace* css_font_face,
+                                          const String& font_name)
+     : face_(css_font_face),
+       font_selector_(font_selector),
+-      font_name_(font_name) {}
++      font_name_(font_name),
++      is_allowed_(FontSelector::IsIrisFontFamilyAllowed(font_name)) {}
+ 
+ LocalFontFaceSource::~LocalFontFaceSource() {}
+ 
+ bool LocalFontFaceSource::IsLocalNonBlocking() const {
++  if (!is_allowed_) {
++    return true;
++  }
+   FontUniqueNameLookup* unique_name_lookup =
+       FontGlobalContext::Get().GetFontUniqueNameLookup();
+   if (!unique_name_lookup) {
+@@ -42,6 +46,9 @@ bool LocalFontFaceSource::IsLocalNonBlocking() const {
+ 
+ bool LocalFontFaceSource::IsLocalFontAvailable(
+     const FontDescription& font_description) const {
++  if (!is_allowed_) {
++    return false;
++  }
+   // TODO(crbug.com/1025945): Properly handle Windows prior to 10 and Android.
+   bool font_available = FontCache::Get().IsPlatformFontUniqueNameMatchAvailable(
+       font_description, font_name_);
+diff --git third_party/blink/renderer/core/css/local_font_face_source.h third_party/blink/renderer/core/css/local_font_face_source.h
+index 64456bcff3bb9e477c82ac3c069176ffe173dfa2..1988a9a4e9518bdba386a88754404312fb48bc80 100644
+--- third_party/blink/renderer/core/css/local_font_face_source.h
++++ third_party/blink/renderer/core/css/local_font_face_source.h
+@@ -69,6 +69,7 @@ class LocalFontFaceSource final : public CSSFontFaceSource,
+   Member<FontSelector> font_selector_;
+ 
+   AtomicString font_name_;
++  const bool is_allowed_;
+   LocalFontHistograms histograms_;
+ };
+ 
+diff --git third_party/blink/renderer/core/css/offscreen_font_selector.cc third_party/blink/renderer/core/css/offscreen_font_selector.cc
+index d47f7ddafd8d2cc771e9e9fdf4b0218a11d59a63..b6afecf1e819b5525c9e38e29e9df19a42b0b4a2 100644
+--- third_party/blink/renderer/core/css/offscreen_font_selector.cc
++++ third_party/blink/renderer/core/css/offscreen_font_selector.cc
+@@ -13,7 +13,6 @@ namespace blink {
+ 
+ OffscreenFontSelector::OffscreenFontSelector(WorkerGlobalScope* worker)
+     : worker_(worker) {
+-  DCHECK(worker);
+   font_face_cache_ = MakeGarbageCollected<FontFaceCache>();
+   FontCache::Get().AddClient(this);
+ }
+@@ -43,6 +42,10 @@ const FontData* OffscreenFontSelector::GetFontData(
+           font_face_cache_->Get(font_description, family_name)) {
+     return face->GetFontData(font_description);
+   }
++  if (!font_family.FamilyIsGeneric() &&
++      !IsIrisFontFamilyAllowed(family_name)) {
++    return nullptr;
++  }
+ 
+   // Try to return the correct font based off our settings, in case we were
+   // handed the generic font family name.
+diff --git third_party/blink/renderer/core/html/canvas/unique_font_selector.cc third_party/blink/renderer/core/html/canvas/unique_font_selector.cc
+index ffd79a3880c399e10a9e94678c528d4d28f12a3d..43fb716325543a6fe645fd48fd710ed5a3453dc4 100644
+--- third_party/blink/renderer/core/html/canvas/unique_font_selector.cc
++++ third_party/blink/renderer/core/html/canvas/unique_font_selector.cc
+@@ -67,7 +67,9 @@ const Font* UniqueFontSelector::FindOrCreateFont(
+       lru_list_.MoveTo(it, lru_list_.cbegin());
+       return add_result.stored_value->value.font;
+     }
+-    font = MakeGarbageCollected<Font>(description, base_selector_);
++    font = MakeGarbageCollected<Font>(
++        description,
++        base_selector_ ? base_selector_->GetCanvasFontSelector() : nullptr);
+     add_result.stored_value->value.font = font;
+     lru_list_.push_front(LruListKey{description, frame_generation_});
+     add_result.stored_value->value.list_index = lru_list_.begin().GetIndex();
+diff --git third_party/blink/renderer/modules/permissions/permissions.cc third_party/blink/renderer/modules/permissions/permissions.cc
+index e36c344035c0006fbb9f9bc50a42281744c6fb31..d066aa39a73cae6f0faf6bb8118e46bd0b9c7bc9 100644
+--- third_party/blink/renderer/modules/permissions/permissions.cc
++++ third_party/blink/renderer/modules/permissions/permissions.cc
+@@ -8,6 +8,7 @@
+ #include <utility>
+ 
+ #include "base/metrics/histogram_functions.h"
++#include "build/build_config.h"
+ #include "third_party/blink/public/common/permissions/permission_utils.h"
+ #include "third_party/blink/public/mojom/page/page.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
+@@ -276,6 +277,12 @@ void Permissions::TaskComplete(
+       resolver->GetExecutionContext()->IsContextDestroyed())
+     return;
+ 
++  // A new local-fonts query starts at prompt in the Windows reference profile.
++  // Keep the existing listener: subsequent native permission changes still
++  // update held PermissionStatus objects and dispatch their change events.
++  if (BUILDFLAG(IS_WIN) && descriptor->name == PermissionName::LOCAL_FONTS)
++    result->status = mojom::blink::PermissionStatus::ASK;
++
+   PermissionStatusListener* listener = GetOrCreatePermissionStatusListener(
+       std::move(result), std::move(descriptor));
+   if (listener)
+diff --git third_party/blink/renderer/platform/fonts/font_fallback_list.cc third_party/blink/renderer/platform/fonts/font_fallback_list.cc
+index a35f4d61b28cdcd3c878726fa36cbb0f1b69e2bd..85fe8fa83bda84c701c0a032bb720ab1b195270f 100644
+--- third_party/blink/renderer/platform/fonts/font_fallback_list.cc
++++ third_party/blink/renderer/platform/fonts/font_fallback_list.cc
+@@ -156,7 +156,9 @@ const FontData* FontFallbackList::GetFontData(
+     family_index_++;
+     if (!font_selector_) {
+       // Don't query system fonts for empty font family name.
+-      if (!curr_family->FamilyName().empty()) {
++      if (!curr_family->FamilyName().empty() &&
++          (curr_family->FamilyIsGeneric() ||
++           FontSelector::IsIrisFontFamilyAllowed(curr_family->FamilyName()))) {
+         if (auto* result = FontCache::Get().GetFontData(
+                 font_description, curr_family->FamilyName())) {
+           return result;
+@@ -168,7 +170,9 @@ const FontData* FontFallbackList::GetFontData(
+     const FontData* result =
+         font_selector_->GetFontData(font_description, *curr_family);
+     // Don't query system fonts for empty font family name.
+-    if (!result && !curr_family->FamilyName().empty()) {
++    if (!result && !curr_family->FamilyName().empty() &&
++        (curr_family->FamilyIsGeneric() ||
++         FontSelector::IsIrisFontFamilyAllowed(curr_family->FamilyName()))) {
+       result = FontCache::Get().GetFontData(font_description,
+                                             curr_family->FamilyName());
+     }
+diff --git third_party/blink/renderer/platform/fonts/font_selector.cc third_party/blink/renderer/platform/fonts/font_selector.cc
+index 9b0055dd231b10b41b5010dab0702374589d330f..ac11f4d4a3e99710b159d83e9a290b77efa36175 100644
+--- third_party/blink/renderer/platform/fonts/font_selector.cc
++++ third_party/blink/renderer/platform/fonts/font_selector.cc
+@@ -4,7 +4,9 @@
+ 
+ #include "third_party/blink/renderer/platform/fonts/font_selector.h"
+ 
++#include "base/containers/span.h"
+ #include "build/build_config.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/platform/fonts/alternate_font_family.h"
+ #include "third_party/blink/renderer/platform/fonts/font_cache.h"
+@@ -14,9 +16,19 @@
+ #include "third_party/blink/renderer/platform/fonts/font_family.h"
+ #include "third_party/blink/renderer/platform/fonts/generic_font_family_settings.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
++#include "third_party/blink/renderer/platform/wtf/text/string_view.h"
+ 
+ namespace blink {
+ 
++bool FontSelector::IsIrisFontFamilyAllowed(const StringView& family) {
++  for (std::u16string_view allowed : iris::profile::kFontFamiliesUtf16) {
++    if (EqualIgnoringAsciiCase(family, StringView(base::span(allowed)))) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ AtomicString FontSelector::FamilyNameFromSettings(
+     const GenericFontFamilySettings& settings,
+     const FontDescription& font_description,
+diff --git third_party/blink/renderer/platform/fonts/font_selector.h third_party/blink/renderer/platform/fonts/font_selector.h
+index bebf378c601c5e50f5acd677bab46e06862969cd..47c9d63b05b7dc2104113c47ea3a89cb08b63f39 100644
+--- third_party/blink/renderer/platform/fonts/font_selector.h
++++ third_party/blink/renderer/platform/fonts/font_selector.h
+@@ -54,6 +54,10 @@ class PLATFORM_EXPORT FontSelector : public FontCacheClient {
+   virtual const FontData* GetFontData(const FontDescription&,
+                                       const FontFamily&) = 0;
+ 
++  virtual FontSelector* GetCanvasFontSelector() { return this; }
++  // 限制显式本地名称，不裁剪原生 system-ui 和字形回退的实际字体。
++  static bool IsIrisFontFamilyAllowed(const StringView&);
++
+   // TODO(crbug.com/542629): The String variant of this method should be
+   // replaced with a better approach, now that we only have complex text.
+   virtual void WillUseFontData(const FontDescription&,
+diff --git ui/gfx/BUILD.gn ui/gfx/BUILD.gn
+index 2a608f6c14c59390403c057d3eba39a71d34b8d3..410633803588d3210525174e07e53585810f4e28 100644
+--- ui/gfx/BUILD.gn
++++ ui/gfx/BUILD.gn
+@@ -357,6 +357,7 @@ component("gfx") {
+       "onecore.lib",
+     ]
+     all_dependent_configs = [ ":gfx_win_linker_flags" ]
++    deps += [ "//components/iris" ]
+     public_deps += [ "//components/crash/core/common" ]
+   }
+ 
+diff --git ui/gfx/DEPS ui/gfx/DEPS
+index 2bbc51d628908dc1fa530d990f39bd7478d70be4..90bf1ed9b01504b3dbe99afcdf112d1983bfebdf 100644
+--- ui/gfx/DEPS
++++ ui/gfx/DEPS
+@@ -18,6 +18,9 @@ include_rules = [
+ ]
+ 
+ specific_include_rules = {
++  "direct_write\\.cc": [
++    "+components/iris",
++  ],
+   "delegated_ink_point\\.h" : [
+     "+mojo/public/cpp/bindings/struct_traits.h",
+   ],
+diff --git ui/gfx/win/direct_write.cc ui/gfx/win/direct_write.cc
+index 83a95525a4db9fe7ed18325b17ca0105052aa347..db1f2d073fc18bdf872941dd488742ce5df821a2 100644
+--- ui/gfx/win/direct_write.cc
++++ ui/gfx/win/direct_write.cc
+@@ -10,13 +10,17 @@
+ #include <wrl.h>
+ #include <wrl/client.h>
+ 
++#include <algorithm>
++#include <array>
+ #include <string>
+ #include <string_view>
+ 
+ #include "base/debug/alias.h"
+ #include "base/notreached.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/trace_event/trace_event.h"
++#include "components/iris/profile_data.h"
+ #include "skia/ext/font_utils.h"
+ #include "third_party/skia/include/core/SkFontMgr.h"
+ #include "third_party/skia/include/ports/SkTypeface_win.h"
+@@ -116,6 +120,55 @@ void SetDirectWriteFactory(IDWriteFactory* factory) {
+ 
+ }  // anonymous namespace
+ 
++HRESULT PreflightIrisFontProfile(std::wstring* failing_family_name) {
++  if (failing_family_name) {
++    failing_family_name->clear();
++  }
++  Microsoft::WRL::ComPtr<IUnknown> factory_unknown;
++  HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
++                                  __uuidof(IDWriteFactory), &factory_unknown);
++  if (FAILED(hr)) {
++    return hr;
++  }
++  Microsoft::WRL::ComPtr<IDWriteFactory> factory;
++  hr = factory_unknown.As(&factory);
++  if (FAILED(hr)) {
++    return hr;
++  }
++  Microsoft::WRL::ComPtr<IDWriteFontCollection> collection;
++  hr = factory->GetSystemFontCollection(&collection);
++  if (FAILED(hr)) {
++    return hr;
++  }
++
++  // 枚举身份并不保证每个名称都可作 local() 源；预检实际使用的泛型字体，
++  // 不再创建会改变 system-ui、字形回退和字体别名解析的裁剪集合。
++  constexpr std::array required_families{
++      iris::profile::kStandardFont, iris::profile::kSerifFont,
++      iris::profile::kSansSerifFont, iris::profile::kMonospaceFont,
++      iris::profile::kCursiveFont, iris::profile::kFantasyFont,
++      iris::profile::kMathFont};
++  for (size_t index = 0; index < iris::profile::kFontFamilies.size(); ++index) {
++    if (std::ranges::find(required_families,
++                          iris::profile::kFontFamilies[index]) ==
++        required_families.end()) {
++      continue;
++    }
++    const std::wstring_view family =
++        base::AsWStringView(iris::profile::kFontFamiliesUtf16[index]);
++    UINT32 family_index = 0;
++    BOOL exists = FALSE;
++    hr = collection->FindFamilyName(family.data(), &family_index, &exists);
++    if (FAILED(hr) || !exists) {
++      if (failing_family_name) {
++        *failing_family_name = family;
++      }
++      return FAILED(hr) ? hr : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
++    }
++  }
++  return S_OK;
++}
++
+ void SideLoadFontForTesting(base::FilePath path) {
+   if (!g_sideloaded_fonts) {
+     // Note: this list is leaked.
+diff --git ui/gfx/win/direct_write.h ui/gfx/win/direct_write.h
+index 7d3911af5ce21035ee5bc478c3b51abef9cc7553..7b3fe13665eb9941b4ddbf2204c35b247e97907a 100644
+--- ui/gfx/win/direct_write.h
++++ ui/gfx/win/direct_write.h
+@@ -8,6 +8,7 @@
+ #include <dwrite.h>
+ 
+ #include <optional>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -43,6 +44,13 @@ COMPONENT_EXPORT(GFX)
+ std::optional<std::string> RetrieveLocalizedFontName(std::string_view font_name,
+                                                      const std::string& locale);
+ 
++// 在创建首个 web context 前验证 DirectWrite 和 profile 泛型字体。
++// 不裁剪系统字体集合；枚举名称不等同于可用的 local()/PostScript 名称。
++// 失败返回实际 HRESULT，并在可定位时填写缺失字体；调用方报告
++// ProfileUnavailable，不进入 Ready。
++COMPONENT_EXPORT(GFX)
++HRESULT PreflightIrisFontProfile(std::wstring* failing_family_name = nullptr);
++
+ }  // namespace win
+ }  // namespace gfx
+ 

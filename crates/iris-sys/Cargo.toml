@@ -1,0 +1,15 @@
+# iris-sys:StraviaIris 原生共享 SDK 的私有 FFI crate。
+#
+# 仅被 crates/iris 内部使用,不发布、不 re-export 给业务代码;
+# 所有声明必须与 native/include/stravia_iris.h 逐字段一致。
+[package]
+name = "iris-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "StraviaIris native shared SDK private C ABI declarations"
+
+[build-dependencies]
+# 仅用于解析并校验 iris-sdk.json 清单;不引入其它构建依赖。
+serde_json.workspace = true

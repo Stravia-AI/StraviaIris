@@ -1,0 +1,1432 @@
+目的：浏览器、worker 与网络 UA/UA-CH、平台、硬件并发和设备内存使用同一原生 profile。
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：JS、dedicated/shared worker 与本地 HTTP 请求身份一致；不伪造扩展能力或协议字段。
+
+diff --git cef/libcef/common/chrome/chrome_main_delegate_cef.cc cef/libcef/common/chrome/chrome_main_delegate_cef.cc
+index 8ea25052b2b3ec351f1153c9b0f7d797bcc0f219..cc28f6fd9232be3ad15c0d684bc114e209d0c228 100644
+--- cef/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ cef/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -38,7 +38,6 @@
+ #include "net/base/features.h"
+ #include "sandbox/policy/switches.h"
+ #include "third_party/blink/public/common/switches.h"
+-#include "third_party/icu/source/i18n/unicode/timezone.h"
+ #include "ui/base/ui_base_paths.h"
+ #include "ui/base/ui_base_switches.h"
+ 
+@@ -533,19 +532,6 @@ std::variant<int, content::MainFunctionParams>
+ ChromeMainDelegateCef::RunProcess(
+     const std::string& process_type,
+     content::MainFunctionParams main_function_params) {
+-  // BasicStartupComplete 时 ICU 尚未初始化；在所有进程的实际入口前校验，
+-  // 不把未知 ID 静默映射到 GMT。这里只校验，不修改宿主系统时区。
+-  const auto& timezone = iris::GetRuntimeConfig().timezone;
+-  if (!timezone.empty()) {
+-    UErrorCode error = U_ZERO_ERROR;
+-    UBool is_system_id = false;
+-    icu::UnicodeString canonical;
+-    icu::TimeZone::getCanonicalID(icu::UnicodeString::fromUTF8(timezone),
+-                                canonical, is_system_id, error);
+-    if (U_FAILURE(error) || !is_system_id) {
+-      return iris_engine::kInvalidArgumentExit;
+-    }
+-  }
+   if (process_type.empty()) {
+     return runner_->RunMainProcess(std::move(main_function_params));
+   }
+diff --git components/embedder_support/BUILD.gn components/embedder_support/BUILD.gn
+index 847ba42327e113d0ccf22a9f366965700825acbc..0712829f9ec9317d02a346a6236ebe6cc1593289 100644
+--- components/embedder_support/BUILD.gn
++++ components/embedder_support/BUILD.gn
+@@ -58,6 +58,7 @@ static_library("user_agent") {
+   deps = [
+     ":embedder_support",
+     "//build:branding_buildflags",
++    "//components/iris",
+     "//components/policy/core/common",
+     "//components/prefs",
+     "//components/version_info",
+diff --git components/embedder_support/DEPS components/embedder_support/DEPS
+index 85fc43cfc087fbbe781826cc6586760bdd08e2bd..f9f05a10fe04a77010686185a339ad89daedcd36 100644
+--- components/embedder_support/DEPS
++++ components/embedder_support/DEPS
+@@ -3,6 +3,7 @@ include_rules = [
+   "+components/content_settings/browser",
+   "+components/content_settings/core/browser",
+   "+components/content_settings/core/common",
++  "+components/iris",
+   "+components/permissions",
+   "+components/policy/core/common",
+   "+components/prefs",
+diff --git components/embedder_support/user_agent_utils.cc components/embedder_support/user_agent_utils.cc
+index 98b082d2de86161f5e5f37169762c76b800e6c92..7fef4f41cde42061afbbf534ab08233d313678e8 100644
+--- components/embedder_support/user_agent_utils.cc
++++ components/embedder_support/user_agent_utils.cc
+@@ -29,6 +29,7 @@
+ #include "cef/libcef/features/features.h"
+ #include "components/embedder_support/pref_names.h"
+ #include "components/embedder_support/switches.h"
++#include "components/iris/profile_data.h"
+ #include "components/policy/core/common/policy_pref_names.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/version_info/version_info.h"
+@@ -39,7 +40,6 @@
+ #if BUILDFLAG(IS_WIN)
+ #include <windows.h>
+ 
+-#include "base/win/registry.h"
+ #include "base/win/windows_version.h"
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+@@ -63,102 +63,6 @@ namespace embedder_support {
+ 
+ namespace {
+ 
+-#if BUILDFLAG(IS_WIN)
+-
+-// The registry key where the UniversalApiContract version value can be read
+-// from.
+-constexpr wchar_t kWindowsRuntimeWellKnownContractsRegKeyName[] =
+-    L"SOFTWARE\\Microsoft\\WindowsRuntime\\WellKnownContracts";
+-
+-// Name of the UniversalApiContract registry.
+-constexpr wchar_t kUniversalApiContractName[] =
+-    L"Windows.Foundation.UniversalApiContract";
+-
+-// There's a chance that access to the registry key that contains the
+-// UniversalApiContract Version will not be available in the future. After we
+-// confirm that our Windows version is RS5 or greater, it is best to have the
+-// default return value be the highest known version number at the time this
+-// code is submitted. If the UniversalApiContract registry key is no longer
+-// available, there will either be a new API introduced, or we will need
+-// to rely on querying the IsApiContractPresentByMajor function used by
+-// user_agent_utils_unittest.cc.
+-const int kHighestKnownUniversalApiContractVersion = 19;
+-
+-int GetPreRS5UniversalApiContractVersion() {
+-  // This calls Kernel32Version() to get the real non-spoofable version (as
+-  // opposed to base::win::GetVersion() which as of writing this seems to return
+-  // different results depending on compatibility mode, and is spoofable).
+-  // See crbug.com/1404448.
+-  const base::win::Version version = base::win::OSInfo::Kernel32Version();
+-  if (version == base::win::Version::WIN10) {
+-    return 1;
+-  }
+-  if (version == base::win::Version::WIN10_TH2) {
+-    return 2;
+-  }
+-  if (version == base::win::Version::WIN10_RS1) {
+-    return 3;
+-  }
+-  if (version == base::win::Version::WIN10_RS2) {
+-    return 4;
+-  }
+-  if (version == base::win::Version::WIN10_RS3) {
+-    return 5;
+-  }
+-  if (version == base::win::Version::WIN10_RS4) {
+-    return 6;
+-  }
+-  // The list above should account for all Windows versions prior to
+-  // RS5.
+-  NOTREACHED();
+-}
+-
+-// Returns the UniversalApiContract version number, which is available for
+-// Windows versions greater than RS5. Otherwise, returns 0.
+-const std::string& GetUniversalApiContractVersion() {
+-  // Do not use this for runtime environment detection logic. This method should
+-  // only be used to help populate the Sec-CH-UA-Platform client hint. If
+-  // authoring code that depends on a minimum API contract version being
+-  // available, you should instead leverage the OS's IsApiContractPresentByMajor
+-  // method.
+-  static const base::NoDestructor<std::string> universal_api_contract_version(
+-      [] {
+-        int major_version = 0;
+-        int minor_version = 0;
+-        if (base::win::OSInfo::Kernel32Version() <=
+-            base::win::Version::WIN10_RS4) {
+-          major_version = GetPreRS5UniversalApiContractVersion();
+-        } else {
+-          base::win::RegKey version_key(
+-              HKEY_LOCAL_MACHINE, kWindowsRuntimeWellKnownContractsRegKeyName,
+-              KEY_QUERY_VALUE | KEY_WOW64_64KEY);
+-          if (version_key.Valid()) {
+-            DWORD universal_api_contract_version = 0;
+-            LONG result = version_key.ReadValueDW(
+-                kUniversalApiContractName, &universal_api_contract_version);
+-            if (result == ERROR_SUCCESS) {
+-              major_version = HIWORD(universal_api_contract_version);
+-              minor_version = LOWORD(universal_api_contract_version);
+-            } else {
+-              major_version = kHighestKnownUniversalApiContractVersion;
+-            }
+-          } else {
+-            major_version = kHighestKnownUniversalApiContractVersion;
+-          }
+-        }
+-        // The major version of the contract is stored in the HIWORD, while the
+-        // minor version is stored in the LOWORD.
+-        return base::StrCat({base::NumberToString(major_version), ".",
+-                             base::NumberToString(minor_version), ".0"});
+-      }());
+-  return *universal_api_contract_version;
+-}
+-
+-const std::string& GetWindowsPlatformVersion() {
+-  return GetUniversalApiContractVersion();
+-}
+-#endif  // BUILDFLAG(IS_WIN)
+-
+ const blink::UserAgentBrandList GetUserAgentBrandList(
+     const std::string& major_version,
+     const std::string& full_version,
+@@ -167,10 +71,8 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   int major_version_number;
+   bool parse_result = base::StringToInt(major_version, &major_version_number);
+   DCHECK(parse_result);
+-  std::optional<std::string> brand;
+-#if !BUILDFLAG(CHROMIUM_BRANDING)
+-  brand = version_info::GetProductName();
+-#endif
++  // 固定 Windows profile 使用 Chrome 品牌；版本仍来自当前编译的引擎。
++  const std::optional<std::string> brand = "Google Chrome";
+ 
+   std::string brand_version =
+       output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+@@ -220,9 +122,6 @@ const blink::UserAgentBrandList GetUserAgentBrandFullVersionListInternal(
+ // depending on the Reduce User-Agent reduction phase features.
+ std::string GetUserAgentInternal() {
+   std::string product = GetProductAndVersion();
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kHeadless)) {
+-    product.insert(0, "Headless");
+-  }
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(kUseMobileUserAgent)) {
+@@ -576,95 +475,14 @@ blink::UserAgentBrandVersion GetGreasedUserAgentBrandVersion(
+                                          output_version_type);
+ }
+ 
+-bool GetMobileBitForUAMetadata() {
+-  // The mobile bit for UA-CH is true if the platform is iOS, or if it's
+-  // Android and not a desktop form factor, AND the kUseMobileUserAgent switch
+-  // is present.
+-#if BUILDFLAG(IS_ANDROID)
+-  if (base::android::device_info::is_desktop() ||
+-      base::android::device_info::is_xr()) {
+-    return false;
+-  }
+-#endif
+-
+-#if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+-  return base::CommandLine::ForCurrentProcess()->HasSwitch(kUseMobileUserAgent);
+-#else
+-  return false;
+-#endif
+-}
+-
+-std::string GetPlatformVersion() {
+-#if BUILDFLAG(IS_ANDROID)
+-  // For Android XR or desktop form factors, report a non-empty platform
+-  // version when kAndroidDesktopUAPlatform is enabled to follow the spec:
+-  // https://wicg.github.io/ua-client-hints/#sec-ch-ua-platform-version. When
+-  // disabled, their UA-CH platform is spoofed (see GetPlatformForUAMetadata()),
+-  // so they follow the Linux platform version which is empty. Once
+-  // kAndroidDesktopUAPlatform is fully launched, this gating should be removed
+-  // and the real OS version reported unconditionally.
+-  // Note: check the feature flag first since it is cheaper than the device
+-  // info checks.
+-  if (!base::FeatureList::IsEnabled(
+-          blink::features::kAndroidDesktopUAPlatform) &&
+-      (base::android::device_info::is_desktop() ||
+-       base::android::device_info::is_xr())) {
+-    return std::string();
+-  }
+-#endif
+-
+-#if BUILDFLAG(IS_WIN)
+-  return GetWindowsPlatformVersion();
+-#elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_FUCHSIA)
+-  return std::string();
+-#else
+-
+-  int32_t major, minor, bugfix = 0;
+-  base::SysInfo::OperatingSystemVersionNumbers(&major, &minor, &bugfix);
+-  return base::StringPrintf("%d.%d.%d", major, minor, bugfix);
+-#endif
+-}
+-
+-std::string GetPlatformForUAMetadata() {
+-#if BUILDFLAG(IS_ANDROID)
+-  if (base::android::device_info::is_desktop() ||
+-      base::android::device_info::is_xr()) {
+-    return base::FeatureList::IsEnabled(
+-               blink::features::kAndroidDesktopUAPlatform)
+-               ? "Android"
+-               : (base::FeatureList::IsEnabled(
+-                      blink::features::kAndroidDesktopUASpoofAsChromeOS)
+-                      ? "Chrome OS"
+-                      : "Linux");
+-  }
+-#endif
+-
+-#if BUILDFLAG(IS_MAC)
+-  // TODO(crbug.com/40704421): This can be removed/re-refactored once we use
+-  // "macOS" by default
+-  return "macOS";
+-#elif BUILDFLAG(IS_CHROMEOS)
+-  // TODO(crbug.com/40846294): The branding change to remove the space caused a
+-  // regression that's solved here. Ideally, we would just use the new OS name
+-  // without the space here too, but that needs a launch plan.
+-#if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+-  return "Chrome OS";
+-#else
+-  return "Chromium OS";
+-#endif
+-#else
+-  return std::string(version_info::GetOSType());
+-#endif
+-}
+-
+ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   blink::UserAgentMetadata metadata;
+ 
+   // Low entropy client hints.
+   metadata.brand_version_list =
+       GetUserAgentBrandMajorVersionListInternal(std::nullopt);
+-  metadata.mobile = GetMobileBitForUAMetadata();
+-  metadata.platform = GetPlatformForUAMetadata();
++  metadata.mobile = iris::profile::kMobile;
++  metadata.platform = iris::profile::kUaPlatform;
+ 
+   // For users providing a valid user-agent override via the command line:
+   // If kUACHOverrideBlank is enabled, set user-agent metadata with the
+@@ -686,13 +504,13 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   // High entropy client hints.
+   metadata.brand_full_version_list =
+       GetUserAgentBrandFullVersionListInternal(std::nullopt);
+-  metadata.full_version = std::string(version_info::GetVersionNumber());
+-  metadata.architecture = GetCpuArchitecture();
++  metadata.full_version = iris::profile::kFullVersion;
++  metadata.architecture = iris::profile::kUaArchitecture;
+   metadata.model = BuildModelInfo();
+   metadata.form_factors = GetFormFactorsClientHint(metadata, metadata.mobile);
+-  metadata.bitness = GetCpuBitness();
+-  metadata.wow64 = IsWoW64();
+-  metadata.platform_version = GetPlatformVersion();
++  metadata.bitness = iris::profile::kUaBitness;
++  metadata.wow64 = iris::profile::kWow64;
++  metadata.platform_version = iris::profile::kUaPlatformVersion;
+   return metadata;
+ }
+ 
+@@ -711,12 +529,6 @@ std::vector<std::string> GetFormFactorsClientHint(
+   return form_factors;
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
+-int GetHighestKnownUniversalApiContractVersionForTesting() {
+-  return kHighestKnownUniversalApiContractVersion;
+-}
+-#endif  // BUILDFLAG(IS_WIN)
+-
+ std::string GetUnifiedPlatformForTesting() {
+   return GetUnifiedPlatform();
+ }
+diff --git components/embedder_support/user_agent_utils.h components/embedder_support/user_agent_utils.h
+index 39a9d069561c68faf56cb0a75f938b120305b17e..2c65caf93ef213eef111e829e5afd508c8a0c604 100644
+--- components/embedder_support/user_agent_utils.h
++++ components/embedder_support/user_agent_utils.h
+@@ -89,9 +89,6 @@ blink::UserAgentBrandVersion GetGreasedUserAgentBrandVersion(
+     int seed,
+     blink::UserAgentBrandVersionType output_version_type);
+ 
+-#if BUILDFLAG(IS_WIN)
+-int GetHighestKnownUniversalApiContractVersionForTesting();
+-#endif  // BUILDFLAG(IS_WIN)
+ 
+ // Returns the CPU architecture in Windows/Mac/POSIX/Fuchsia and the empty
+ // string on Android or if unknown.
+diff --git components/embedder_support/user_agent_utils_unittest.cc components/embedder_support/user_agent_utils_unittest.cc
+index a0696b7bff77e4cbb3eebe54e2fbbb11cb41b7d8..7bbc7cf3070dc9d96d04f994b0aca9c56d5a2e02 100644
+--- components/embedder_support/user_agent_utils_unittest.cc
++++ components/embedder_support/user_agent_utils_unittest.cc
+@@ -41,16 +41,6 @@
+ #include <sys/utsname.h>
+ #endif
+ 
+-#if BUILDFLAG(IS_WIN)
+-#include <windows.foundation.metadata.h>
+-#include <wrl.h>
+-
+-#include "base/win/core_winrt_util.h"
+-#include "base/win/hstring_reference.h"
+-#include "base/win/scoped_hstring.h"
+-#include "base/win/scoped_winrt_initializer.h"
+-#endif  // BUILDFLAG(IS_WIN)
+-
+ #if BUILDFLAG(IS_ANDROID)
+ #include "base/android/device_info.h"
+ #endif  // BUILDFLAG(IS_ANDROID)
+@@ -234,75 +224,6 @@ void CheckUserAgentStringOrdering(bool mobile_device) {
+   }
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
+-
+-// On Windows, the client hint sec-ch-ua-platform-version should be
+-// the highest supported version of the UniversalApiContract.
+-void VerifyWinPlatformVersion(std::string version) {
+-  base::win::ScopedWinrtInitializer scoped_winrt_initializer;
+-  ASSERT_TRUE(scoped_winrt_initializer.Succeeded());
+-
+-  base::win::HStringReference api_info_class_name(
+-      RuntimeClass_Windows_Foundation_Metadata_ApiInformation);
+-
+-  Microsoft::WRL::ComPtr<
+-      ABI::Windows::Foundation::Metadata::IApiInformationStatics>
+-      api;
+-  HRESULT result = base::win::RoGetActivationFactory(api_info_class_name.Get(),
+-                                                     IID_PPV_ARGS(&api));
+-  ASSERT_EQ(result, S_OK);
+-
+-  base::win::HStringReference universal_contract_name(
+-      L"Windows.Foundation.UniversalApiContract");
+-
+-  std::vector<std::string> version_parts = base::SplitString(
+-      version, ".", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
+-
+-  EXPECT_EQ(version_parts[2], "0");
+-
+-  int major_version;
+-  base::StringToInt(version_parts[0], &major_version);
+-
+-  // If this check fails, our highest known UniversalApiContract version
+-  // needs to be updated.
+-  EXPECT_LE(major_version,
+-            GetHighestKnownUniversalApiContractVersionForTesting());
+-
+-  int minor_version;
+-  base::StringToInt(version_parts[1], &minor_version);
+-
+-  boolean is_supported = false;
+-  // Verify that the major and minor versions are supported.
+-  result = api->IsApiContractPresentByMajor(universal_contract_name.Get(),
+-                                            major_version, &is_supported);
+-  EXPECT_EQ(result, S_OK);
+-  EXPECT_TRUE(is_supported)
+-      << " expected major version " << major_version << " to be supported.";
+-  result = api->IsApiContractPresentByMajorAndMinor(
+-      universal_contract_name.Get(), major_version, minor_version,
+-      &is_supported);
+-  EXPECT_EQ(result, S_OK);
+-  EXPECT_TRUE(is_supported)
+-      << " expected major version " << major_version << " and minor version "
+-      << minor_version << " to be supported.";
+-
+-  // Verify that the next highest value is not supported.
+-  result = api->IsApiContractPresentByMajorAndMinor(
+-      universal_contract_name.Get(), major_version, minor_version + 1,
+-      &is_supported);
+-  EXPECT_EQ(result, S_OK);
+-  EXPECT_FALSE(is_supported) << " expected minor version " << minor_version + 1
+-                             << " to not be supported with a major version of "
+-                             << major_version << ".";
+-  result = api->IsApiContractPresentByMajor(universal_contract_name.Get(),
+-                                            major_version + 1, &is_supported);
+-  EXPECT_EQ(result, S_OK);
+-  EXPECT_FALSE(is_supported) << " expected major version " << major_version + 1
+-                             << " to not be supported.";
+-}
+-
+-#endif  // BUILDFLAG(IS_WIN)
+-
+ bool ContainsBrandVersion(const blink::UserAgentBrandList& brand_list,
+                           const blink::UserAgentBrandVersion brand_version) {
+   for (const auto& brand_list_entry : brand_list) {
+@@ -631,7 +552,7 @@ TEST_F(UserAgentUtilsTest, UserAgentMetadata) {
+   EXPECT_EQ(metadata.full_version, full_version);
+ 
+ #if BUILDFLAG(IS_WIN)
+-  VerifyWinPlatformVersion(metadata.platform_version);
++  EXPECT_EQ(metadata.platform_version, "19.0.0");
+ #elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_FUCHSIA)
+   EXPECT_EQ(metadata.platform_version, "");
+ #else
+@@ -642,9 +563,6 @@ TEST_F(UserAgentUtilsTest, UserAgentMetadata) {
+ #endif
+   // This makes sure no extra information is added to the platform version.
+   EXPECT_EQ(metadata.platform_version.find(";"), std::string::npos);
+-  // If you're here because your change to GetOSType broke this test, it likely
+-  // means that GetPlatformForUAMetadata needs a new special case to prevent
+-  // breaking client hints. Check with the code owners for further guidance.
+ #if BUILDFLAG(IS_WIN)
+   EXPECT_EQ(metadata.platform, "Windows");
+ #elif BUILDFLAG(IS_IOS)
+@@ -1038,13 +956,13 @@ TEST_F(UserAgentUtilsTest, GetUserAgent) {
+ }
+ 
+ TEST_F(UserAgentUtilsTest, HeadlessUserAgent) {
++  const std::string ordinary_user_agent = GetUserAgent();
+   base::test::ScopedCommandLine scoped_command_line;
+   base::CommandLine* command_line = scoped_command_line.GetProcessCommandLine();
+   command_line->AppendSwitch(kHeadless);
+   ASSERT_TRUE(command_line->HasSwitch(kHeadless));
+ 
+-  // In headless mode product name should have the Headless prefix.
+-  EXPECT_THAT(GetUserAgent(), testing::HasSubstr("HeadlessChrome/"));
++  EXPECT_EQ(GetUserAgent(), ordinary_user_agent);
+ }
+ 
+ namespace {
+diff --git content/browser/DEPS content/browser/DEPS
+index 6ddfcb4ff61eaaa176d24b478ddba94cc3d7ff7a..e6d2930772d4595b299ad794e3b81890ca706d01 100644
+--- content/browser/DEPS
++++ content/browser/DEPS
+@@ -15,6 +15,7 @@ include_rules = [
+   "+components/file_access",
+   "+components/filename_generation",
+   "+components/grit",
++  "+components/iris",
+   "+components/language_detection/content/common",
+   "+components/power_monitor",
+   "+components/services/font",
+diff --git content/browser/client_hints/client_hints.cc content/browser/client_hints/client_hints.cc
+index b1778eb6591728093d7da3fa51cdcd03489323ea..d96c493f0531fa5b653180bfd2fb5d2018f6f28e 100644
+--- content/browser/client_hints/client_hints.cc
++++ content/browser/client_hints/client_hints.cc
+@@ -5,6 +5,7 @@
+ #include "content/browser/client_hints/client_hints.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <optional>
+ #include <string>
+ 
+@@ -20,6 +21,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#include "components/iris/profile_data.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/preloading/prerender/prerender_host.h"
+ #include "content/browser/renderer_host/frame_tree.h"
+@@ -139,7 +141,7 @@ double RoundKbpsToMbps(const std::string& host,
+   return downlink_kbps_rounded / 1000;
+ }
+ 
+-double GetDeviceScaleFactor() {
++[[maybe_unused]] double GetDeviceScaleFactor() {
+   double device_scale_factor = 1.0;
+   if (display::Screen::Get()) {
+     device_scale_factor =
+@@ -187,7 +189,7 @@ std::string DoubleToSpecCompliantString(double value) {
+ 
+ // Return the effective connection type value overridden for web APIs.
+ // If no override value has been set, a null value is returned.
+-std::optional<net::EffectiveConnectionType>
++[[maybe_unused]] std::optional<net::EffectiveConnectionType>
+ GetWebHoldbackEffectiveConnectionType() {
+   if (!base::FeatureList::IsEnabled(
+           features::kNetworkQualityEstimatorWebHoldback)) {
+@@ -238,9 +240,8 @@ void RemoveClientHintHeader(WebClientHintsType client_hint_type,
+ void AddDeviceMemoryHeader(net::HttpRequestHeaders* headers,
+                            bool use_deprecated_version = false) {
+   DCHECK(headers);
+-  blink::ApproximatedDeviceMemory::Initialize();
+-  const float device_memory =
+-      blink::ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
++  // Iris: 头部与 JS deviceMemory 同源，统一取 profile 的近似值而非独立口径。
++  const float device_memory = iris::profile::kDeviceMemory;
+   DCHECK_LT(0.0, device_memory);
+   SetHeaderToDouble(headers,
+                     use_deprecated_version
+@@ -255,7 +256,8 @@ void AddDPRHeader(net::HttpRequestHeaders* headers,
+                   bool use_deprecated_version = false) {
+   DCHECK(headers);
+   DCHECK(context);
+-  double device_scale_factor = GetDeviceScaleFactor();
++  // Iris: dpr 头部与 JS devicePixelRatio 同源，统一取 profile 值而非宿主实测。
++  const double device_scale_factor = iris::profile::kDeviceScaleFactor;
+   double zoom_factor = GetZoomFactor(context, url);
+   SetHeaderToDouble(headers,
+                     use_deprecated_version ? WebClientHintsType::kDpr_DEPRECATED
+@@ -387,19 +389,9 @@ void AddRttHeader(net::HttpRequestHeaders* headers,
+                   const GURL& url) {
+   DCHECK(headers);
+ 
+-  std::optional<net::EffectiveConnectionType> web_holdback_ect =
+-      GetWebHoldbackEffectiveConnectionType();
+-
+-  base::TimeDelta http_rtt;
+-  if (web_holdback_ect.has_value()) {
+-    http_rtt = net::NetworkQualityEstimatorParams::GetDefaultTypicalHttpRtt(
+-        web_holdback_ect.value());
+-  } else if (network_quality_tracker) {
+-    http_rtt = network_quality_tracker->GetHttpRTT();
+-  } else {
+-    http_rtt = net::NetworkQualityEstimatorParams::GetDefaultTypicalHttpRtt(
+-        net::EFFECTIVE_CONNECTION_TYPE_UNKNOWN);
+-  }
++  // Iris: rtt 头部与 JS NetInfo 同源，统一取 profile 值而非宿主实测。
++  const base::TimeDelta http_rtt =
++      base::Milliseconds(iris::profile::kConnectionRttMs);
+   SetHeaderToInt(headers, WebClientHintsType::kRtt_DEPRECATED,
+                  RoundRtt(url.GetHost(), http_rtt));
+ }
+@@ -408,23 +400,9 @@ void AddDownlinkHeader(net::HttpRequestHeaders* headers,
+                        network::NetworkQualityTracker* network_quality_tracker,
+                        const GURL& url) {
+   DCHECK(headers);
+-  std::optional<net::EffectiveConnectionType> web_holdback_ect =
+-      GetWebHoldbackEffectiveConnectionType();
+-
+-  int32_t downlink_throughput_kbps;
+-
+-  if (web_holdback_ect.has_value()) {
+-    downlink_throughput_kbps =
+-        net::NetworkQualityEstimatorParams::GetDefaultTypicalDownlinkKbps(
+-            web_holdback_ect.value());
+-  } else if (network_quality_tracker) {
+-    downlink_throughput_kbps =
+-        network_quality_tracker->GetDownstreamThroughputKbps();
+-  } else {
+-    downlink_throughput_kbps =
+-        net::NetworkQualityEstimatorParams::GetDefaultTypicalDownlinkKbps(
+-            net::EFFECTIVE_CONNECTION_TYPE_UNKNOWN);
+-  }
++  // Iris: downlink 头部与 JS NetInfo 同源，统一取 profile 值而非宿主实测。
++  const int32_t downlink_throughput_kbps = static_cast<int32_t>(
++      std::lround(iris::profile::kConnectionDownlinkMbps * 1000));
+ 
+   SetHeaderToDouble(headers, WebClientHintsType::kDownlink_DEPRECATED,
+                     RoundKbpsToMbps(url.GetHost(), downlink_throughput_kbps));
+@@ -435,19 +413,11 @@ void AddEctHeader(net::HttpRequestHeaders* headers,
+                   const GURL& url) {
+   DCHECK(headers);
+ 
+-  std::optional<net::EffectiveConnectionType> web_holdback_ect =
+-      GetWebHoldbackEffectiveConnectionType();
+-
+-  int effective_connection_type;
+-  if (web_holdback_ect.has_value()) {
+-    effective_connection_type = web_holdback_ect.value();
+-  } else if (network_quality_tracker) {
+-    effective_connection_type =
+-        static_cast<int>(network_quality_tracker->GetEffectiveConnectionType());
+-  } else {
+-    effective_connection_type =
+-        static_cast<int>(net::EFFECTIVE_CONNECTION_TYPE_UNKNOWN);
+-  }
++  // Iris: ect 头部与 JS effectiveType 同源，统一取 profile 值而非宿主实测。
++  int effective_connection_type = static_cast<int>(
++      net::GetEffectiveConnectionTypeForName(
++          std::string(iris::profile::kConnectionEffectiveType))
++          .value_or(net::EFFECTIVE_CONNECTION_TYPE_UNKNOWN));
+ 
+   SetHeaderToString(
+       headers, WebClientHintsType::kEct_DEPRECATED,
+diff --git content/browser/speech/speech_synthesis_impl.cc content/browser/speech/speech_synthesis_impl.cc
+index daefb65183761693eb8a1be4b9562221b24fac14..a48ba5a0e55eab717b3a99a23b2410f451c65727 100644
+--- content/browser/speech/speech_synthesis_impl.cc
++++ content/browser/speech/speech_synthesis_impl.cc
+@@ -4,10 +4,15 @@
+ 
+ #include "content/browser/speech/speech_synthesis_impl.h"
+ 
++#include <memory>
++#include <utility>
++
++#include "base/supports_user_data.h"
+ #include "content/browser/media/audio_stream_monitor.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/speech/tts_utterance_impl.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
++#include "content/public/browser/browser_context.h"
+ #include "content/public/browser/web_contents.h"
+ 
+ namespace content {
+@@ -96,18 +101,95 @@ class EventThunk : public UtteranceEventDelegate {
+   bool is_audible_;
+ };
+ 
++// Iris: 与参考引擎一致 —— 每个 BrowserContext 的首个语音表消费者收到
++// 固定 persona 语音表 (3 个 en-US 本地语音 + 19 个 Google 网络语音);
++// 其余消费者及后续 voiceschanged 更新返回真实平台语音表。
++const std::vector<VoiceData>& IrisPersonaVoices() {
++  struct IrisVoiceRow {
++    const char* name;
++    const char* lang;
++    bool remote;
++  };
++  static constexpr IrisVoiceRow kRows[] = {
++      {"Microsoft David - English (United States)", "en-US", false},
++      {"Microsoft Mark - English (United States)", "en-US", false},
++      {"Microsoft Zira - English (United States)", "en-US", false},
++      {"Google Deutsch", "de-DE", true},
++      {"Google US English", "en-US", true},
++      {"Google UK English Female", "en-GB", true},
++      {"Google UK English Male", "en-GB", true},
++      {"Google español", "es-ES", true},
++      {"Google español de Estados Unidos", "es-US", true},
++      {"Google français", "fr-FR", true},
++      {"Google हिन्दी", "hi-IN", true},
++      {"Google Bahasa Indonesia", "id-ID", true},
++      {"Google italiano", "it-IT", true},
++      {"Google 日本語", "ja-JP", true},
++      {"Google 한국의", "ko-KR", true},
++      {"Google Nederlands", "nl-NL", true},
++      {"Google polski", "pl-PL", true},
++      {"Google português do Brasil", "pt-BR", true},
++      {"Google русский", "ru-RU", true},
++      {"Google 普通话（中国大陆）", "zh-CN", true},
++      {"Google 粤語（香港）", "zh-HK", true},
++      {"Google 國語（臺灣）", "zh-TW", true},
++  };
++  static const std::vector<VoiceData>* voices = [] {
++    auto* list = new std::vector<VoiceData>();
++    for (const IrisVoiceRow& row : kRows) {
++      VoiceData voice;
++      voice.name = row.name;
++      voice.lang = row.lang;
++      voice.remote = row.remote;
++      voice.native = !row.remote;
++      list->push_back(voice);
++    }
++    return list;
++  }();
++  return *voices;
++}
++
++// Iris: persona 语音表按 BrowserContext 分发 —— 每个 BrowserContext
++// (含 incognito)的首个语音表消费者收到 persona 表,之后该上下文内的
++// 消费者收到真实平台语音表。
++class IrisPersonaAssignment : public base::SupportsUserData::Data {
++ public:
++  static bool Consume(BrowserContext* browser_context) {
++    auto* assignment = static_cast<IrisPersonaAssignment*>(
++        browser_context->GetUserData(UserDataKey()));
++    if (!assignment) {
++      auto owned = std::make_unique<IrisPersonaAssignment>();
++      assignment = owned.get();
++      browser_context->SetUserData(UserDataKey(), std::move(owned));
++    }
++    return !std::exchange(assignment->consumed_, true);
++  }
++
++ private:
++  static const void* UserDataKey() {
++    static const int kKey = 0;
++    return &kKey;
++  }
++
++  bool consumed_ = false;
++};
++
+ void SendVoiceListToObserver(
+     blink::mojom::SpeechSynthesisVoiceListObserver* observer,
+-    const std::vector<VoiceData>& voices) {
++    const std::vector<VoiceData>& voices,
++    bool persona) {
++  const std::vector<VoiceData>* effective =
++      persona ? &IrisPersonaVoices() : &voices;
+   std::vector<blink::mojom::SpeechSynthesisVoicePtr> out_voices;
+-  out_voices.resize(voices.size());
+-  for (size_t i = 0; i < voices.size(); ++i) {
++  out_voices.resize(effective->size());
++  for (size_t i = 0; i < effective->size(); ++i) {
++    const VoiceData& voice = (*effective)[i];
+     blink::mojom::SpeechSynthesisVoicePtr& out_voice = out_voices[i];
+     out_voice = blink::mojom::SpeechSynthesisVoice::New();
+-    out_voice->voice_uri = voices[i].name;
+-    out_voice->name = voices[i].name;
+-    out_voice->lang = voices[i].lang;
+-    out_voice->is_local_service = !voices[i].remote;
++    out_voice->voice_uri = voice.name;
++    out_voice->name = voice.name;
++    out_voice->lang = voice.lang;
++    out_voice->is_local_service = !voice.remote;
+     out_voice->is_default = (i == 0);
+   }
+   observer->OnSetVoiceList(std::move(out_voices));
+@@ -119,7 +201,8 @@ SpeechSynthesisImpl::SpeechSynthesisImpl(BrowserContext* browser_context,
+                                          RenderFrameHostImpl* rfh)
+     : browser_context_(browser_context),
+       web_contents_(WebContents::FromRenderFrameHost((rfh))),
+-      frame_id_(rfh->GetGlobalId()) {
++      frame_id_(rfh->GetGlobalId()),
++      iris_persona_(IrisPersonaAssignment::Consume(browser_context)) {
+   DCHECK(browser_context_);
+   DCHECK(web_contents_);
+   TtsController::GetInstance()->AddVoicesChangedDelegate(this);
+@@ -146,7 +229,7 @@ void SpeechSynthesisImpl::AddVoiceListObserver(
+ 
+   std::vector<VoiceData> voices;
+   TtsController::GetInstance()->GetVoices(browser_context_, GURL(), &voices);
+-  SendVoiceListToObserver(observer.get(), voices);
++  SendVoiceListToObserver(observer.get(), voices, iris_persona_);
+ 
+   observer_set_.Add(std::move(observer));
+ }
+@@ -199,7 +282,7 @@ void SpeechSynthesisImpl::OnVoicesChanged() {
+   std::vector<VoiceData> voices;
+   TtsController::GetInstance()->GetVoices(browser_context_, GURL(), &voices);
+   for (auto& observer : observer_set_)
+-    SendVoiceListToObserver(observer.get(), voices);
++    SendVoiceListToObserver(observer.get(), voices, iris_persona_);
+ }
+ 
+ }  // namespace content
+diff --git content/browser/speech/speech_synthesis_impl.h content/browser/speech/speech_synthesis_impl.h
+index 3777555052039d58f7c4cf8e2bbf3fc64148365d..3898fa380a34cb892fee4ab52460feabd7d9c498 100644
+--- content/browser/speech/speech_synthesis_impl.h
++++ content/browser/speech/speech_synthesis_impl.h
+@@ -51,6 +51,9 @@ class SpeechSynthesisImpl : public blink::mojom::SpeechSynthesis,
+   raw_ptr<WebContents> web_contents_;
+   GlobalRenderFrameHostId frame_id_;
+ 
++  // Iris: 所属 BrowserContext 的首个语音消费者实例固定返回 persona 语音表。
++  const bool iris_persona_;
++
+   mojo::ReceiverSet<blink::mojom::SpeechSynthesis> receiver_set_;
+   mojo::RemoteSet<blink::mojom::SpeechSynthesisVoiceListObserver> observer_set_;
+ };
+diff --git storage/browser/BUILD.gn storage/browser/BUILD.gn
+index 197f1d78a7a73798cf74a52b401ac2b81073ed53..04b7e37f80701491642d12d10746b9388d005e3a 100644
+--- storage/browser/BUILD.gn
++++ storage/browser/BUILD.gn
+@@ -227,6 +227,7 @@ component("browser") {
+     "//build:chromeos_buildflags",
+     "//components/crash/core/common:crash_key",
+     "//components/file_access",
++    "//components/iris",
+     "//components/services/storage/public/cpp",
+     "//components/services/storage/public/cpp/filesystem",
+     "//mojo/public/cpp/bindings",
+diff --git storage/browser/quota/quota_manager_impl.cc storage/browser/quota/quota_manager_impl.cc
+index e8df0be505370521cc423d5e318597854579b37a..edb99396f29227ac3657d1738dc58f487a2921d9 100644
+--- storage/browser/quota/quota_manager_impl.cc
++++ storage/browser/quota/quota_manager_impl.cc
+@@ -49,6 +49,7 @@
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/types/pass_key.h"
++#include "components/iris/profile_data.h"
+ #include "components/services/storage/public/cpp/buckets/bucket_locator.h"
+ #include "components/services/storage/public/cpp/buckets/constants.h"
+ #include "components/services/storage/public/mojom/quota_client.mojom.h"
+@@ -137,27 +138,8 @@ base::FilePath CreateMediaLicenseBucketPath(const base::FilePath& profile_path,
+ int64_t CalculateReportedQuota(int64_t total_space_bytes,
+                                int64_t usage_bytes,
+                                bool is_incognito) {
+-  base::ClampedNumeric<int64_t> clamped_total_space_bytes(total_space_bytes);
+-  base::ClampedNumeric<int64_t> clamped_usage_bytes(usage_bytes);
+-
+-  // The flag kIncognitoStaticStorageQuota fixes the return value in incognito
+-  // to 10 GiB + usage, as in regular mode.
+-  bool enforce_static_quota_for_incognito =
+-      (is_incognito &&
+-       base::FeatureList::IsEnabled(features::kIncognitoStaticStorageQuota));
+-  if ((clamped_total_space_bytes >= 10 * QuotaManagerImpl::kGBytes) ||
+-      enforce_static_quota_for_incognito) {
+-    return clamped_usage_bytes + 10 * QuotaManagerImpl::kGBytes;
+-  }
+-
+-  // Generally, we report a quota value of 10 GiB. However, if there is less
+-  // than 10 GiB of disk space, the quota value we report is disk space rounded
+-  // up to the nearest 1 GiB.
+-  base::ClampedNumeric<int64_t> rounded_total_space_gib =
+-      (clamped_total_space_bytes / QuotaManagerImpl::kGBytes) +
+-      (clamped_total_space_bytes % QuotaManagerImpl::kGBytes != 0);
+-  return clamped_usage_bytes +
+-         rounded_total_space_gib * QuotaManagerImpl::kGBytes;
++  // Iris: estimate().quota 为 profile 固定值，不随宿主磁盘或用量变化。
++  return iris::profile::kStorageQuota;
+ }
+ 
+ }  // namespace
+diff --git third_party/blink/common/BUILD.gn third_party/blink/common/BUILD.gn
+index 8da7aacae01d2fc0aa073a2c8ddf77160fc07bc8..a009c1ed28c5f92ffd9062328656843807e6defb 100644
+--- third_party/blink/common/BUILD.gn
++++ third_party/blink/common/BUILD.gn
+@@ -307,6 +307,7 @@ source_set("common") {
+     "//base",
+     "//build:android_buildflags",
+     "//build:chromecast_buildflags",
++    "//components/iris",
+     "//media/capture:capture_base",
+     "//media/capture/mojom:video_capture_mojom_support",
+     "//mojo/public/cpp/system",
+diff --git third_party/blink/common/DEPS third_party/blink/common/DEPS
+index 10d3a58c78be24381a6200fb2e9c017a47c5f4f4..d1901e48ea05b3ed1a566396a28badfc2901a4af 100644
+--- third_party/blink/common/DEPS
++++ third_party/blink/common/DEPS
+@@ -10,6 +10,7 @@ include_rules = [
+     "+build",
+     "+crypto/hash.h",
+     "+cc/mojom/browser_controls_params.mojom.h",
++    "+components/iris",
+     "+gpu/command_buffer/common/shared_image_usage.h",
+     "+net",
+     "+media",
+diff --git third_party/blink/common/device_memory/approximated_device_memory.cc third_party/blink/common/device_memory/approximated_device_memory.cc
+index 7fd53ebba0dc53be6e085620010edc962de37f9e..b9f67f9c5d957d01b245ad0e63b67e631669539b 100644
+--- third_party/blink/common/device_memory/approximated_device_memory.cc
++++ third_party/blink/common/device_memory/approximated_device_memory.cc
+@@ -7,7 +7,7 @@
+ #include "base/byte_size.h"
+ #include "base/check_op.h"
+ #include "base/feature_list.h"
+-#include "base/system/sys_info.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/common/features.h"
+ 
+ namespace blink {
+@@ -20,9 +20,7 @@ int64_t ApproximatedDeviceMemory::physical_memory_mb_ = 0;
+ void ApproximatedDeviceMemory::Initialize() {
+   if (approximated_device_memory_gb_ > 0.0)
+     return;
+-  DCHECK_EQ(0, physical_memory_mb_);
+-  physical_memory_mb_ = ::base::SysInfo::AmountOfTotalPhysicalMemory().InMiB();
+-  CalculateAndSetApproximatedDeviceMemory();
++  approximated_device_memory_gb_ = iris::profile::kDeviceMemory;
+ }
+ 
+ // static
+diff --git third_party/blink/renderer/DEPS third_party/blink/renderer/DEPS
+index 62bb80d18e54187a821a22a8ecfa31501d983232..114bb7ce31a6af148ae02f5f2affee3283b4b908 100644
+--- third_party/blink/renderer/DEPS
++++ third_party/blink/renderer/DEPS
+@@ -95,6 +95,7 @@ include_rules = [
+     "+cc/input/hit_test_opaqueness.h",
+     "+cc/paint",
+     "+components/crash/core/common/crash_key.h",
++    "+components/iris",
+     "+net/base/features.h",
+     "+net/cookies",
+     "+net/http/structured_headers.h",
+diff --git third_party/blink/renderer/core/BUILD.gn third_party/blink/renderer/core/BUILD.gn
+index 8969a71c827f03bfa1b472b2ec30f8b5c6726c1f..799ca33a31d0aeed39f76c24501d10ebbbdbe768 100644
+--- third_party/blink/renderer/core/BUILD.gn
++++ third_party/blink/renderer/core/BUILD.gn
+@@ -408,6 +408,7 @@ component("core") {
+     ":make_deprecation_info",
+     ":xml_ffi",
+     "//base",
++    "//components/iris",
+     "//components/paint_preview/common",
+     "//components/performance_manager/public/mojom:mojom_blink",
+     "//components/shared_highlighting/core/common",
+diff --git third_party/blink/renderer/core/events/navigator_events.cc third_party/blink/renderer/core/events/navigator_events.cc
+index a57561775c1197c98d93aaddd96a47674b7ad953..86108b95a54bc7170b21901ae17d4a2ca3fe428f 100644
+--- third_party/blink/renderer/core/events/navigator_events.cc
++++ third_party/blink/renderer/core/events/navigator_events.cc
+@@ -30,16 +30,12 @@
+ 
+ #include "third_party/blink/renderer/core/events/navigator_events.h"
+ 
+-#include "third_party/blink/renderer/core/frame/local_dom_window.h"
+-#include "third_party/blink/renderer/core/frame/local_frame.h"
+-#include "third_party/blink/renderer/core/frame/navigator.h"
+-#include "third_party/blink/renderer/core/frame/settings.h"
++#include "components/iris/profile_data.h"
+ 
+ namespace blink {
+ 
+-int32_t NavigatorEvents::maxTouchPoints(Navigator& navigator) {
+-  LocalDOMWindow* window = navigator.DomWindow();
+-  return window ? window->GetFrame()->GetSettings()->GetMaxTouchPoints() : 0;
++int32_t NavigatorEvents::maxTouchPoints(Navigator&) {
++  return iris::profile::kMaxTouchPoints;
+ }
+ 
+ }  // namespace blink
+diff --git third_party/blink/renderer/core/execution_context/navigator_base.cc third_party/blink/renderer/core/execution_context/navigator_base.cc
+index cccfafe8f93a0228d08352c6d4f27391935848ba..887ef4e4de3374c4e1f1d4804de4e09a6ba1ba7e 100644
+--- third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -4,8 +4,10 @@
+ 
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+ 
++#include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+@@ -29,7 +31,7 @@ String GetReducedNavigatorPlatform() {
+ #elif BUILDFLAG(IS_MAC)
+   return "MacIntel";
+ #elif BUILDFLAG(IS_WIN)
+-  return "Win32";
++  return String(base::span(iris::profile::kPlatform));
+ #elif BUILDFLAG(IS_FUCHSIA)
+   return "";
+ #elif BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+diff --git third_party/blink/renderer/core/frame/navigator.cc third_party/blink/renderer/core/frame/navigator.cc
+index 583f05f8dd5fb74116ad81da63ee7e43445f8060..bfebc529c4d86dd4afe127f7af514e376bb54f10 100644
+--- third_party/blink/renderer/core/frame/navigator.cc
++++ third_party/blink/renderer/core/frame/navigator.cc
+@@ -23,6 +23,8 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ 
++#include "base/containers/span.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+@@ -33,7 +35,6 @@
+ #include "third_party/blink/renderer/core/loader/frame_loader.h"
+ #include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+-#include "third_party/blink/renderer/platform/language.h"
+ 
+ namespace blink {
+ 
+@@ -107,10 +108,7 @@ bool Navigator::webdriver() const {
+ }
+ 
+ String Navigator::GetAcceptLanguages() {
+-  if (!DomWindow())
+-    return DefaultLanguage();
+-
+-  return DomWindow()->GetFrame()->GetPage()->GetSettings().GetAcceptLanguages();
++  return String(base::span(iris::profile::kAcceptLanguage));
+ }
+ 
+ void Navigator::Trace(Visitor* visitor) const {
+diff --git third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2d1b58de1fb54aa6545de8ac0fb177319e..6a57fb87b7df1ca99d6c8d60ddc6e6c3c7270571 100644
+--- third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -4,12 +4,12 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ 
+-#include "base/system/sys_info.h"
++#include "components/iris/profile_data.h"
+ 
+ namespace blink {
+ 
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
+-  return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
++  return iris::profile::kHardwareConcurrency;
+ }
+ 
+ }  // namespace blink
+diff --git third_party/blink/renderer/core/html/media/html_media_element.cc third_party/blink/renderer/core/html/media/html_media_element.cc
+index 1a7cbc65252f6459d4b55a4fffa3f59060b1dca8..495aa18320774e083eb935dbe57678022528fd12 100644
+--- third_party/blink/renderer/core/html/media/html_media_element.cc
++++ third_party/blink/renderer/core/html/media/html_media_element.cc
+@@ -119,6 +119,7 @@
+ #include "third_party/blink/renderer/platform/mediastream/media_stream_descriptor.h"
+ #include "third_party/blink/renderer/platform/network/mime/content_type.h"
+ #include "third_party/blink/renderer/platform/network/mime/mime_type_from_url.h"
++#include "third_party/blink/renderer/platform/network/mime/mime_type_registry.h"
+ #include "third_party/blink/renderer/platform/network/network_state_notifier.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/event_loop.h"
+@@ -398,9 +399,17 @@ MIMETypeRegistry::SupportsType HTMLMediaElement::GetSupportsType(
+   // |contentType| could be handled using ParsedContentType, but there are
+   // still a lot of sites using codec strings that don't work with the
+   // stricter parsing rules.
+-  MIMETypeRegistry::SupportsType result =
+-      MIMETypeRegistry::SupportsMediaMIMEType(type, type_codecs);
+-  return result;
++  // Iris: 与参考引擎一致的媒体能力口径 —— 已知容器 + codec 确认 →
++  // kSupported；已知容器 → kMaybeSupported；未知容器 → kNotSupported。
++  switch (iris_caps::MediaElementSupport(type, type_codecs)) {
++    case iris_caps::CodecSupport::kConfirmed:
++      return MIMETypeRegistry::kSupported;
++    case iris_caps::CodecSupport::kMaybe:
++      return MIMETypeRegistry::kMaybeSupported;
++    case iris_caps::CodecSupport::kUnknownContainer:
++      return MIMETypeRegistry::kNotSupported;
++  }
++  return MIMETypeRegistry::kNotSupported;
+ }
+ 
+ bool HTMLMediaElement::IsHLSURL(const KURL& url) {
+diff --git third_party/blink/renderer/core/loader/frame_fetch_context.cc third_party/blink/renderer/core/loader/frame_fetch_context.cc
+index 9e0a5ccdac505c701be2be0e5b8677bff0d1d824..eaf2a21de2adf997b1cbc5153f10931591615c31 100644
+--- third_party/blink/renderer/core/loader/frame_fetch_context.cc
++++ third_party/blink/renderer/core/loader/frame_fetch_context.cc
+@@ -56,6 +56,7 @@ BASE_FEATURE(kFastMemoryCacheWithDevTools, base::FEATURE_ENABLED_BY_DEFAULT);
+ #include "services/network/public/mojom/web_client_hints_types.mojom-shared.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/blink/public/common/client_hints/client_hints.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/common/device_memory/approximated_device_memory.h"
+ #include "third_party/blink/public/common/permissions_policy/document_policy_features.h"
+ #include "third_party/blink/public/common/switches.h"
+@@ -683,8 +684,7 @@ void FrameFetchContext::AddClientHintsIfNecessary(
+                            hints_preferences)) {
+     request.SetHttpHeaderField(
+         http_names::kDeviceMemory_DEPRECATED,
+-        AtomicString(String::Number(
+-            ApproximatedDeviceMemory::GetApproximatedDeviceMemory())));
++        AtomicString(String::Number(iris::profile::kDeviceMemory)));
+   }
+ 
+   if (ShouldSendClientHint(*policy, resource_origin,
+@@ -692,18 +692,15 @@ void FrameFetchContext::AddClientHintsIfNecessary(
+                            hints_preferences)) {
+     request.SetHttpHeaderField(
+         http_names::kDeviceMemory,
+-        AtomicString(String::Number(
+-            ApproximatedDeviceMemory::GetApproximatedDeviceMemory())));
++        AtomicString(String::Number(iris::profile::kDeviceMemory)));
+   }
+ 
+   if (ShouldSendClientHint(*policy, resource_origin,
+                            WebClientHintsType::kRtt_DEPRECATED,
+                            hints_preferences)) {
+-    std::optional<base::TimeDelta> http_rtt =
+-        GetNetworkStateNotifier().GetWebHoldbackHttpRtt();
+-    if (!http_rtt) {
+-      http_rtt = GetNetworkStateNotifier().HttpRtt();
+-    }
++    // Iris: rtt 头部与 JS NetInfo 同源，统一取 profile 值而非宿主实测。
++    const base::TimeDelta http_rtt =
++        base::Milliseconds(iris::profile::kConnectionRttMs);
+ 
+     uint32_t rtt = GetNetworkStateNotifier().RoundRtt(
+         request.Url().Host().ToString(), http_rtt);
+@@ -714,11 +711,8 @@ void FrameFetchContext::AddClientHintsIfNecessary(
+   if (ShouldSendClientHint(*policy, resource_origin,
+                            WebClientHintsType::kDownlink_DEPRECATED,
+                            hints_preferences)) {
+-    std::optional<double> throughput_mbps =
+-        GetNetworkStateNotifier().GetWebHoldbackDownlinkThroughputMbps();
+-    if (!throughput_mbps) {
+-      throughput_mbps = GetNetworkStateNotifier().DownlinkThroughputMbps();
+-    }
++    // Iris: downlink 头部与 JS NetInfo 同源，统一取 profile 值而非宿主实测。
++    const double throughput_mbps = iris::profile::kConnectionDownlinkMbps;
+ 
+     double mbps = GetNetworkStateNotifier().RoundMbps(
+         request.Url().Host().ToString(), throughput_mbps);
+@@ -729,16 +723,14 @@ void FrameFetchContext::AddClientHintsIfNecessary(
+   if (ShouldSendClientHint(*policy, resource_origin,
+                            WebClientHintsType::kEct_DEPRECATED,
+                            hints_preferences)) {
+-    std::optional<WebEffectiveConnectionType> holdback_ect =
+-        GetNetworkStateNotifier().GetWebHoldbackEffectiveType();
+-    if (!holdback_ect) {
+-      holdback_ect = GetNetworkStateNotifier().EffectiveType();
+-    }
++    // Iris: ect 头部与 JS effectiveType 同源，统一取 profile 值("4g")而非宿主实测。
++    const WebEffectiveConnectionType holdback_ect =
++        WebEffectiveConnectionType::kType4G;
+ 
+     request.SetHttpHeaderField(
+         http_names::kEct_DEPRECATED,
+         AtomicString(NetworkStateNotifier::EffectiveConnectionTypeToString(
+-            holdback_ect.value())));
++            holdback_ect)));
+   }
+ 
+   // Only send User Agent hints if the info is available
+diff --git third_party/blink/renderer/core/workers/worker_navigator.cc third_party/blink/renderer/core/workers/worker_navigator.cc
+index db1a55d008e76f82189c55aab9869776832a18d7..e4a3935116253e25c82364e099f8ce30c9a3c40c 100644
+--- third_party/blink/renderer/core/workers/worker_navigator.cc
++++ third_party/blink/renderer/core/workers/worker_navigator.cc
+@@ -25,6 +25,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/workers/worker_navigator.h"
++
++#include "base/containers/span.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/platform/web_worker_fetch_context.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+ #include "third_party/blink/renderer/core/dom/events/event_target.h"
+@@ -41,16 +44,7 @@ WorkerNavigator::WorkerNavigator(ExecutionContext* execution_context)
+ WorkerNavigator::~WorkerNavigator() = default;
+ 
+ String WorkerNavigator::GetAcceptLanguages() {
+-  auto* global_scope = To<WorkerOrWorkletGlobalScope>(GetExecutionContext());
+-  if (!global_scope) {
+-    // Prospective fix for crbug.com/40945292 and crbug.com/40827704
+-    // Return empty string since it is better than crashing here, and the return
+-    // value is not that important since the worker context is already
+-    // destroyed.
+-    return "";
+-  }
+-
+-  return global_scope->GetAcceptLanguages();
++  return String(base::span(iris::profile::kAcceptLanguage));
+ }
+ 
+ void WorkerNavigator::NotifyUpdate() {
+diff --git third_party/blink/renderer/modules/mediarecorder/media_recorder.cc third_party/blink/renderer/modules/mediarecorder/media_recorder.cc
+index c84e540318f0d91fb77a853e28929d7c78f05716..dd9dc1266bfbbf06d10f1d6fd49ceff6bc966411 100644
+--- third_party/blink/renderer/modules/mediarecorder/media_recorder.cc
++++ third_party/blink/renderer/modules/mediarecorder/media_recorder.cc
+@@ -32,6 +32,7 @@
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "third_party/blink/renderer/platform/mediastream/media_stream_descriptor.h"
+ #include "third_party/blink/renderer/platform/network/mime/content_type.h"
++#include "third_party/blink/renderer/platform/network/mime/mime_type_registry.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+@@ -400,12 +401,9 @@ bool MediaRecorder::isTypeSupported(ExecutionContext* context,
+   // specified MIME type. Recording may still fail if sufficient resources are
+   // not available to support the concrete media encoding.
+   // https://w3c.github.io/mediacapture-record/#dom-mediarecorder-istypesupported
++  // Iris: 与参考引擎一致 —— 已知媒体容器一律返回 true（忽略 codecs）。
+   ContentType content_type(type);
+-  bool result = handler->CanSupportMimeType(
+-      content_type.GetType(), content_type.Parameter("codecs"),
+-      MediaRecorderHandler::CanSupportMimeTypeCaller::kIsTypeSupported);
+-
+-  return result;
++  return iris_caps::IsKnownMediaContainer(content_type.GetType());
+ }
+ 
+ const AtomicString& MediaRecorder::InterfaceName() const {
+diff --git third_party/blink/renderer/modules/mediasource/media_source.cc third_party/blink/renderer/modules/mediasource/media_source.cc
+index d87d072e75f372e8ba6b8a973048571c373ab949..aa52c4ae60b538121f606835d1dfb18c4075224f 100644
+--- third_party/blink/renderer/modules/mediasource/media_source.cc
++++ third_party/blink/renderer/modules/mediasource/media_source.cc
+@@ -569,7 +569,9 @@ bool MediaSource::IsTypeSupportedInternal(ExecutionContext* context,
+   // support leaking into HtmlMediaElement.canPlayType. If the stream parser
+   // is enabled, we should check that the codecs are valid using the mp4
+   // container, since it can support any of the codecs we support for mp2t.
+-  if (mime_type == "video/mp2t") {
++  // Iris: mp2t 不在参考引擎的已知容器集合内，跳过该旁路。
++  if (mime_type == "video/mp2t" &&
++      iris_caps::IsKnownMediaContainer(mime_type)) {
+     std::vector<std::string> parsed_codec_ids;
+     media::SplitCodecs(codecs.Ascii(), &parsed_codec_ids);
+     for (const auto& codec_id : parsed_codec_ids) {
+@@ -655,10 +657,10 @@ bool MediaSource::IsTypeSupportedInternal(ExecutionContext* context,
+   // specificity is and will be retained for isTypeSupported.
+   // TODO(crbug.com/535738): Actually relax the codec-specifity for aSB() and
+   // cT() (which is when |enforce_codec_specificity| is false).
+-  MIMETypeRegistry::SupportsType supported =
+-      MIMETypeRegistry::SupportsMediaSourceMIMEType(mime_type, codecs);
++  // Iris: 与参考引擎一致 —— 已知媒体容器一律返回 true（忽略 codecs），
++  // 未知容器（含 mp2t 等）返回 false。
++  bool result = iris_caps::IsKnownMediaContainer(mime_type);
+ 
+-  bool result = supported == MIMETypeRegistry::kSupported;
+ 
+   DVLOG(2) << __func__ << "(" << type << ", "
+            << base::ToString(enforce_codec_specificity) << ") -> "
+diff --git third_party/blink/renderer/modules/netinfo/BUILD.gn third_party/blink/renderer/modules/netinfo/BUILD.gn
+index 30e5c847caa447f488cad34df8e30b23f729f5fb..884d688b51fe0ec734929eb64f230c8b3df7448a 100644
+--- third_party/blink/renderer/modules/netinfo/BUILD.gn
++++ third_party/blink/renderer/modules/netinfo/BUILD.gn
+@@ -9,4 +9,8 @@ blink_modules_sources("netinfo") {
+     "network_information.cc",
+     "network_information.h",
+   ]
++
++  deps = [
++    "//components/iris",
++  ]
+ }
+diff --git third_party/blink/renderer/modules/netinfo/network_information.cc third_party/blink/renderer/modules/netinfo/network_information.cc
+index 976a3c8c36dbfa20f1271918bd0570a4d9d4419f..1886c0cbc027a8856d30c605ab09ea2dc616b412 100644
+--- third_party/blink/renderer/modules/netinfo/network_information.cc
++++ third_party/blink/renderer/modules/netinfo/network_information.cc
+@@ -5,8 +5,10 @@
+ #include "third_party/blink/renderer/modules/netinfo/network_information.h"
+ 
+ #include <algorithm>
++#include <string_view>
+ 
+ #include "base/time/time.h"
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_connection_type.h"
+@@ -73,6 +75,20 @@ String GetConsoleLogStringForWebHoldback() {
+          "and so may be inaccurate";
+ }
+ 
++// Iris: NetInfo 读数由 profile 固定，不反映宿主链路实测。
++V8EffectiveConnectionType::Enum ProfileEffectiveType(std::string_view value) {
++  if (value == "slow-2g") {
++    return V8EffectiveConnectionType::Enum::kSlow2G;
++  }
++  if (value == "2g") {
++    return V8EffectiveConnectionType::Enum::k2G;
++  }
++  if (value == "3g") {
++    return V8EffectiveConnectionType::Enum::k3G;
++  }
++  return V8EffectiveConnectionType::Enum::k4G;
++}
++
+ }  // namespace
+ 
+ NetworkInformation::~NetworkInformation() {
+@@ -119,16 +135,9 @@ V8EffectiveConnectionType NetworkInformation::effectiveType() {
+         EffectiveConnectionTypeToEnum(override_ect.value()));
+   }
+ 
+-  // effective_type_ is only updated when listening for events, so ask
+-  // networkStateNotifier if not listening (crbug.com/379841).
+-  if (!IsObserving()) {
+-    return V8EffectiveConnectionType(EffectiveConnectionTypeToEnum(
+-        GetNetworkStateNotifier().EffectiveType()));
+-  }
+-
+-  // If observing, return m_type which changes when the event fires, per spec.
++  // Iris: effectiveType 固定为 profile 值；宿主估计不进 JS 面。
+   return V8EffectiveConnectionType(
+-      EffectiveConnectionTypeToEnum(effective_type_));
++      ProfileEffectiveType(iris::profile::kConnectionEffectiveType));
+ }
+ 
+ uint32_t NetworkInformation::rtt() {
+@@ -139,12 +148,7 @@ uint32_t NetworkInformation::rtt() {
+     return GetNetworkStateNotifier().RoundRtt(Host(), override_rtt.value());
+   }
+ 
+-  if (!IsObserving()) {
+-    return GetNetworkStateNotifier().RoundRtt(
+-        Host(), GetNetworkStateNotifier().HttpRtt());
+-  }
+-
+-  return http_rtt_msec_;
++  return iris::profile::kConnectionRttMs;
+ }
+ 
+ double NetworkInformation::downlink() {
+@@ -156,17 +160,11 @@ double NetworkInformation::downlink() {
+                                                override_downlink_mbps.value());
+   }
+ 
+-  if (!IsObserving()) {
+-    return GetNetworkStateNotifier().RoundMbps(
+-        Host(), GetNetworkStateNotifier().DownlinkThroughputMbps());
+-  }
+-
+-  return downlink_mbps_;
++  return iris::profile::kConnectionDownlinkMbps;
+ }
+ 
+ bool NetworkInformation::saveData() const {
+-  bool save_data =
+-      IsObserving() ? save_data_ : GetNetworkStateNotifier().SaveDataEnabled();
++  bool save_data = iris::profile::kConnectionSaveData;
+ 
+   probe::ApplyDataSaverOverride(probe::ToCoreProbeSink(GetExecutionContext()),
+                                 save_data);
+diff --git third_party/blink/renderer/platform/network/mime/mime_type_registry.h third_party/blink/renderer/platform/network/mime/mime_type_registry.h
+index dd3ae6c489210dc884d212a7756ce5b93e3d1885..7faabb5117887bb7898f066ac378cbdd2f175d30 100644
+--- third_party/blink/renderer/platform/network/mime/mime_type_registry.h
++++ third_party/blink/renderer/platform/network/mime/mime_type_registry.h
+@@ -30,6 +30,7 @@
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_hash.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#include "third_party/blink/renderer/platform/wtf/vector.h"
+ 
+ namespace blink {
+ 
+@@ -120,6 +121,93 @@ class PLATFORM_EXPORT MIMETypeRegistry {
+   static bool IsPlainTextMIMEType(const String& mime_type);
+ };
+ 
++// Iris: 与参考引擎一致的媒体能力口径：
++// - MediaRecorder.isTypeSupported / MediaSource.isTypeSupported：
++//   已知媒体容器一律返回 true（忽略 codecs 参数），未知容器 false。
++// - HTMLMediaElement.canPlayType：未知容器 ""；已知容器 + codec 已确认
++//   → "probably"；已知容器但 codec 未确认 → "maybe"。
++namespace iris_caps {
++
++// 已知容器集合（实测参考引擎得出）：
++//   video/: mp4, webm, ogg, x-matroska, 3gpp
++//   audio/: mp4, mp3, mpeg, ogg, wav, webm, flac, aac, x-m4a
++inline bool IsKnownMediaContainer(const String& mime_type) {
++  const String mime = mime_type.DeprecatedLower();
++  const String::size_type slash = mime.find('/');
++  if (slash == String::npos)
++    return false;
++  const String type = mime.substr(0, slash);
++  const String sub = mime.substr(slash + 1);
++  if (type == "video") {
++    return sub == "mp4" || sub == "webm" || sub == "ogg" ||
++           sub == "x-matroska" || sub == "3gpp";
++  }
++  if (type == "audio") {
++    return sub == "mp4" || sub == "mp3" || sub == "mpeg" || sub == "ogg" ||
++           sub == "wav" || sub == "webm" || sub == "flac" || sub == "aac" ||
++           sub == "x-m4a";
++  }
++  return false;
++}
++
++// 单个 codec token 在给定容器中是否被确认（→ probably）。
++// 未确认集合：av01/av1、mp3、mp4v.*、ac-3、ec-3、dvhe、theora(非 ogg)、
++// wav 中除 "1"(PCM) 外的数字 token 等。
++inline bool IsConfirmedCodecToken(const String& container_sub,
++                                  const String& token) {
++  if (token == "theora")
++    return container_sub == "ogg";
++  if (token == "1")
++    return container_sub == "wav";
++  return token.starts_with("avc1") || token.starts_with("avc3") ||
++         token.starts_with("hev1") || token.starts_with("hvc1") ||
++         token == "vp8" || token == "vp9" || token.starts_with("vp09.") ||
++         token.starts_with("mp4a.") || token == "opus" || token == "vorbis" ||
++         token == "flac";
++}
++
++enum class CodecSupport {
++  kUnknownContainer,
++  kMaybe,
++  kConfirmed,
++};
++
++// HTMLMediaElement.canPlayType 的三级口径。
++inline CodecSupport MediaElementSupport(const String& mime_type,
++                                        const String& codecs) {
++  if (!IsKnownMediaContainer(mime_type))
++    return CodecSupport::kUnknownContainer;
++  const String mime = mime_type.DeprecatedLower();
++  const String::size_type slash = mime.find('/');
++  const String type = mime.substr(0, slash);
++  const String sub = mime.substr(slash + 1);
++
++  if (codecs.empty()) {
++    // 隐式 codec 容器：mpeg/mp3→mp3、flac→flac、aac→aac 已确认；
++    // 其余裸容器无隐含 codec → maybe。
++    const bool implicit_confirmed =
++        type == "audio" &&
++        (sub == "mpeg" || sub == "mp3" || sub == "flac" || sub == "aac");
++    return implicit_confirmed ? CodecSupport::kConfirmed
++                              : CodecSupport::kMaybe;
++  }
++
++  // 全部 codec token 均确认 → probably；任一未确认 → maybe。
++  Vector<String> tokens = codecs.Split(',');
++  bool saw_token = false;
++  for (const String& raw : tokens) {
++    const String token = raw.StripWhiteSpace();
++    if (token.empty())
++      continue;
++    saw_token = true;
++    if (!IsConfirmedCodecToken(sub, token))
++      return CodecSupport::kMaybe;
++  }
++  return saw_token ? CodecSupport::kConfirmed : CodecSupport::kMaybe;
++}
++
++}  // namespace iris_caps
++
+ }  // namespace blink
+ 
+ #endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_NETWORK_MIME_MIME_TYPE_REGISTRY_H_

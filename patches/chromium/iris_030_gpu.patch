@@ -1,0 +1,181 @@
+目的：按固定画像返回 WebGL 与 WebGPU 身份；保留原生 GPU、CPU 及 PBO 读回行为
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：设备身份与受支持特性顺序匹配画像；所有读回保留原始数据，负偏移计算不发生有符号溢出
+
+diff --git gpu/command_buffer/client/gles2_implementation.cc gpu/command_buffer/client/gles2_implementation.cc
+index fbfc14aab85fdcfc8a8a117ba5c753b533db12d6..81d078341b3e352395e475c92c71085bdd5bfbfd 100644
+--- gpu/command_buffer/client/gles2_implementation.cc
++++ gpu/command_buffer/client/gles2_implementation.cc
+@@ -16,6 +16,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <limits>
+ #include <map>
+ #include <memory>
+ #include <set>
+@@ -4775,7 +4776,9 @@ void GLES2Implementation::ReadPixels(GLint xoffset,
+   uint32_t group_size = GLES2Util::ComputeImageGroupSize(format, type);
+   uint32_t skip_row_bytes = 0;
+   if (xoffset < 0) {
+-    skip_row_bytes = static_cast<uint32_t>(-xoffset) * group_size;
++    skip_row_bytes =
++        base::CheckMul(-int64_t{xoffset}, group_size)
++            .ValueOrDefault<uint32_t>(std::numeric_limits<uint32_t>::max());
+   }
+   do {
+     // Even if height == 0, we still need to trigger the service side handling
+diff --git third_party/blink/renderer/modules/webgl/BUILD.gn third_party/blink/renderer/modules/webgl/BUILD.gn
+index d6112079449f9ee9f75565297e79aef4eddc2045..19bf1c44a8c265ed45bd874ea3c7785cc0a40c7d 100644
+--- third_party/blink/renderer/modules/webgl/BUILD.gn
++++ third_party/blink/renderer/modules/webgl/BUILD.gn
+@@ -195,6 +195,7 @@ blink_modules_sources("webgl") {
+ 
+   public_deps = [ "//device/vr/public/mojom:vr_service_blink" ]
+   deps = [
++    "//components/iris",
+     "//device/vr/buildflags",
+     "//gpu/command_buffer/client:gles2_implementation",
+     "//gpu/command_buffer/client:gles2_interface",
+diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index fb1bc7c968496654dc7f35280a022826edbcd5ed..fb288a9ddd681548c2c7e93400f8e8f4e4130372 100644
+--- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -45,6 +45,7 @@
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "components/iris/profile_data.h"
+ #include "components/viz/common/gpu/raster_context_provider.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "device/vr/buildflags/buildflags.h"
+@@ -4202,7 +4203,7 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+         return WebGLAny(script_state,
+-                        String(ContextGL()->GetString(GL_RENDERER)));
++                        String::FromUtf8(iris::profile::kWebGlRenderer));
+       }
+       SynthesizeGLError(
+           GL_INVALID_ENUM, "getParameter",
+@@ -4211,7 +4212,7 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+         return WebGLAny(script_state,
+-                        String(ContextGL()->GetString(GL_VENDOR)));
++                        String::FromUtf8(iris::profile::kWebGlVendor));
+       }
+       SynthesizeGLError(
+           GL_INVALID_ENUM, "getParameter",
+diff --git third_party/blink/renderer/modules/webgpu/BUILD.gn third_party/blink/renderer/modules/webgpu/BUILD.gn
+index f883ab27a40689d27e05d12f3fe45afd47953f4a..fd30f4b261ba5bfcb6de8ab6873491bc36f15094 100644
+--- third_party/blink/renderer/modules/webgpu/BUILD.gn
++++ third_party/blink/renderer/modules/webgpu/BUILD.gn
+@@ -111,6 +111,7 @@ blink_modules_sources("webgpu") {
+     "wgsl_language_features.h",
+   ]
+   deps = [
++    "//components/iris",
+     "//gpu/command_buffer/client:webgpu_interface",
+     "//services/metrics/public/cpp:ukm_builders",
+     "//skia",
+diff --git third_party/blink/renderer/modules/webgpu/gpu_adapter.cc third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+index 44527d0a7b264441eac9c25fa8b9347aeeb5c7d1..4b1546f58456975ae90719a9f6c5c3bb06c14d12 100644
+--- third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
++++ third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+@@ -4,6 +4,12 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter.h"
+ 
++#include <array>
++#include <string_view>
++#include <utility>
++
++#include "base/check.h"
++#include "components/iris/profile_data.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+@@ -31,21 +37,35 @@ namespace blink {
+ namespace {
+ 
+ GPUSupportedFeatures* MakeFeatureNameSet(wgpu::Adapter adapter) {
++  // 固定 profile 的插入顺序；仅初始化一次映射，避免每个 adapter 分配
++  // 完整宿主特性表。实际支持检查仍由 Dawn 执行。
++  static const auto profile_features = [] {
++    std::array<std::pair<wgpu::FeatureName, V8GPUFeatureName::Enum>,
++               iris::profile::kWebGpuFeatures.size()>
++        mapped{};
++    for (size_t i = 0; i < mapped.size(); ++i) {
++      bool found = false;
++      for (size_t value = 0; value < V8GPUFeatureName::kEnumSize; ++value) {
++        const V8GPUFeatureName name(
++            static_cast<V8GPUFeatureName::Enum>(value));
++        if (std::string_view(name.AsCStr()) ==
++            iris::profile::kWebGpuFeatures[i]) {
++          mapped[i] = {AsDawnEnum(name), name.AsEnum()};
++          found = true;
++          break;
++        }
++      }
++      CHECK(found);
++    }
++    return mapped;
++  }();
+   GPUSupportedFeatures* features = MakeGarbageCollected<GPUSupportedFeatures>();
+   DCHECK(features->FeatureNameSet().empty());
+ 
+-  wgpu::SupportedFeatures supported_features;
+-  adapter.GetFeatures(&supported_features);
+-  // SAFETY: Required from caller
+-  const auto features_span = UNSAFE_BUFFERS(base::span<const wgpu::FeatureName>(
+-      supported_features.features, supported_features.featureCount));
+-  for (const auto& f : features_span) {
+-    auto feature_name_enum_optional =
+-        GPUSupportedFeatures::ToV8FeatureNameEnum(f);
+-    if (feature_name_enum_optional) {
+-      features->AddFeatureName(
+-          V8GPUFeatureName(feature_name_enum_optional.value()));
+-      }
++  for (const auto& [native_name, script_name] : profile_features) {
++    if (adapter.HasFeature(native_name)) {
++      features->AddFeatureName(V8GPUFeatureName(script_name));
++    }
+   }
+   return features;
+ }
+diff --git third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+index 9d155705c1350357cc82e5907ab376eb25a56140..f3b1baf83d82900d4d39cfb13b934908cd5fb86d 100644
+--- third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
++++ third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter_info.h"
+ 
++#include "components/iris/profile_data.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_subgroup_matrix_config.h"
+ 
+@@ -22,14 +23,14 @@ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
+                                const std::optional<uint32_t> d3d_shader_model,
+                                const std::optional<uint32_t> vk_driver_version,
+                                const String& power_preference)
+-    : vendor_(vendor),
+-      architecture_(architecture),
++    : vendor_(String::FromUtf8(iris::profile::kWebGpuVendor)),
++      architecture_(String::FromUtf8(iris::profile::kWebGpuArchitecture)),
+       subgroup_min_size_(subgroup_min_size),
+       subgroup_max_size_(subgroup_max_size),
+       is_fallback_adapter_(is_fallback_adapter),
+-      device_(device),
+-      description_(description),
+-      driver_(driver),
++      device_(String::FromUtf8(iris::profile::kWebGpuDevice)),
++      description_(String::FromUtf8(iris::profile::kWebGpuDescription)),
++      driver_(g_empty_string),
+       backend_(backend),
+       type_(type),
+       d3d_shader_model_(d3d_shader_model),

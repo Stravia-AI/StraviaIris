@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>StraviaIris 指纹测量演示</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 16px auto; max-width: 1180px;
+         padding: 0 12px; font-size: 14px; line-height: 1.45; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 18px 0 6px; border-bottom: 1px solid #8888; padding-bottom: 3px; }
+  .sub { color: #888; margin: 0 0 10px; }
+  pre { background: #8882; border: 1px solid #8884; padding: 8px; overflow: auto; max-height: 340px;
+        font-size: 12px; white-space: pre-wrap; word-break: break-all; margin: 0; }
+  section.error > h2 { color: #e5484d; }
+  section.error > pre { border-color: #e5484d; }
+  .checks { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .checks th, .checks td { border: 1px solid #8885; padding: 3px 7px; text-align: left; }
+  .checks td.st { white-space: nowrap; font-weight: 600; }
+  .pass { color: #2e7d32; } .fail { color: #e5484d; }
+  form { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+  input[type=text] { padding: 5px 8px; width: 260px; }
+  button { padding: 5px 14px; }
+  #form-result { margin-top: 4px; }
+  .iframes { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+  footer { margin: 20px 0 30px; color: #888; font-size: 12px; }
+</style>
+<script>
+/* 第一段脚本：在任何其他脚本执行前同步采样。本文件中的导航请求 JSON 占位符
+   由本地 fixture 服务器在响应导航请求时替换为该请求的真实 JSON（方法/路径/已测量请求头）。 */
+(function () {
+  'use strict';
+  function nativeSource(fn) {
+    try { var s = Function.prototype.toString.call(fn); return { source: s, nativeCode: /\[native code\]/.test(s) }; }
+    catch (e) { return { source: null, nativeCode: false, error: String(e) }; }
+  }
+  function describe(protoName, prop) {
+    try {
+      var proto = window[protoName] && window[protoName].prototype;
+      if (!proto) return { present: false, reason: 'no ' + protoName };
+      var d = Object.getOwnPropertyDescriptor(proto, prop);
+      if (!d) return { present: false, onPrototype: false };
+      var g = typeof d.get === 'function' ? d.get : null;
+      var info = g ? nativeSource(g) : null;
+      return { present: true, onPrototype: true, hasGetter: !!g,
+               nativeCode: !!(info && info.nativeCode), getterSource: info ? info.source : null };
+    } catch (e) { return { present: false, error: String(e) }; }
+  }
+  var navigation = @@IRIS_NAVIGATION@@;
+  var n = navigator;
+  var first = {
+    sampledAt: new Date().toISOString(),
+    href: location.href,
+    navigationRequest: navigation,
+    navigator: {
+      userAgent: typeof n.userAgent === 'string' ? n.userAgent : null,
+      appVersion: typeof n.appVersion === 'string' ? n.appVersion : null,
+      platform: typeof n.platform === 'string' ? n.platform : null,
+      language: typeof n.language === 'string' ? n.language : null,
+      languages: Array.isArray(n.languages) ? Array.from(n.languages) : null,
+      hardwareConcurrency: typeof n.hardwareConcurrency === 'number' ? n.hardwareConcurrency : null,
+      deviceMemory: typeof n.deviceMemory === 'number' ? n.deviceMemory : null,
+      maxTouchPoints: typeof n.maxTouchPoints === 'number' ? n.maxTouchPoints : null,
+      pdfViewerEnabled: typeof n.pdfViewerEnabled === 'boolean' ? n.pdfViewerEnabled : null,
+      userAgentData: n.userAgentData ? {
+        brands: n.userAgentData.brands.map(function (b) { return [b.brand, b.version]; }),
+        mobile: n.userAgentData.mobile,
+        platform: n.userAgentData.platform
+      } : null
+    },
+    webdriver: {
+      typeofValue: typeof n.webdriver,
+      value: n.webdriver === undefined ? null : n.webdriver,
+      inNavigator: 'webdriver' in n,
+      descriptorOnNavigatorPrototype: !!Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver'),
+      descriptorOnNavigatorInstance: !!Object.getOwnPropertyDescriptor(n, 'webdriver')
+    },
+    descriptors: {
+      'Navigator.prototype.userAgent': describe('Navigator', 'userAgent'),
+      'Navigator.prototype.appVersion': describe('Navigator', 'appVersion'),
+      'Navigator.prototype.platform': describe('Navigator', 'platform'),
+      'Navigator.prototype.language': describe('Navigator', 'language'),
+      'Navigator.prototype.languages': describe('Navigator', 'languages'),
+      'Navigator.prototype.hardwareConcurrency': describe('Navigator', 'hardwareConcurrency'),
+      'Navigator.prototype.deviceMemory': describe('Navigator', 'deviceMemory'),
+      'Navigator.prototype.maxTouchPoints': describe('Navigator', 'maxTouchPoints'),
+      'Navigator.prototype.webdriver': describe('Navigator', 'webdriver'),
+      'Navigator.prototype.userAgentData': describe('Navigator', 'userAgentData'),
+      'Screen.prototype.width': describe('Screen', 'width'),
+      'Screen.prototype.height': describe('Screen', 'height')
+    },
+    nativeFunctionSources: {
+      'NavigatorUAData.prototype.getHighEntropyValues':
+        nativeSource(n.userAgentData && n.userAgentData.getHighEntropyValues),
+      'Intl.DateTimeFormat.prototype.resolvedOptions':
+        nativeSource(Intl.DateTimeFormat && Intl.DateTimeFormat.prototype.resolvedOptions),
+      'Date.prototype.getTimezoneOffset': nativeSource(Date.prototype.getTimezoneOffset),
+      'WebGLRenderingContext.prototype.getParameter':
+        nativeSource(window.WebGLRenderingContext && WebGLRenderingContext.prototype.getParameter),
+      'CanvasRenderingContext2D.prototype.getImageData':
+        nativeSource(window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype.getImageData)
+    }
+  };
+  window.irisFirstSample = first;
+  /* 表单提交结果 Promise：自动化客户端在 form.requestSubmit() 后立即查询
+     window.irisSubmission 并 await，因此必须在页面脚本早期就创建。 */
+  window.irisSubmission = new Promise(function (resolve) { window.__irisSubmitResolve = resolve; });
+  /* 提前注册 service worker，与后续测量并行以缩短总耗时。 */
+  window.irisSwRegistration = (navigator.serviceWorker
+    ? navigator.serviceWorker.register('/service-worker.js', { scope: '/' })
+    : Promise.reject(new Error('navigator.serviceWorker 不可用')));
+})();/*iris-first*/
+</script>
+<script src="/probe.js"></script>
+</head>
+<body>
+<h1>StraviaIris 指纹测量演示</h1>
+<p class="sub">本页所有数值均来自当前浏览器实际执行结果（原始测量，不做 getter 注入、不预置展示值）。
+measureText / getImageData / readPixels / OfflineAudioContext 等接口名保持英文原文。</p>
+
+<section id="sec-form">
+  <h2>表单（真实 POST /submit，application/x-www-form-urlencoded）</h2>
+  <form id="demo-form" method="post" action="/submit">
+    <label for="name">姓名</label>
+    <input id="name" name="name" type="text" autocomplete="off" placeholder="由自动化客户端填入或手动输入">
+    <button type="submit">提交到 /submit</button>
+  </form>
+  <pre id="form-result">尚未提交。</pre>
+</section>
+
+<section id="sec-first">
+  <h2>首脚本采样（Navigator / getter 描述符 / 导航请求）</h2>
+  <pre id="out-first">测量中…</pre>
+</section>
+
+<section id="sec-contexts">
+  <h2>跨上下文身份（同源 iframe / localhost 跨站 iframe / dedicated / shared / service worker）</h2>
+  <div class="iframes" id="iframe-host"></div>
+  <pre id="out-contexts">测量中…</pre>
+</section>
+
+<section id="sec-timezone">
+  <h2>时区（Date 冬/夏偏移 + Intl）</h2>
+  <pre id="out-timezone">测量中…</pre>
+</section>
+
+<section id="sec-screen">
+  <h2>屏幕 / devicePixelRatio / matchMedia / orientation</h2>
+  <pre id="out-screen">测量中…</pre>
+</section>
+
+<section id="sec-webgl">
+  <h2>WebGL 1/2 身份、真实 capability 与 readPixels/PBO 读回矩阵</h2>
+  <pre id="out-webgl">测量中…</pre>
+</section>
+
+<section id="sec-webgpu">
+  <h2>WebGPU adapter 元数据与 capability</h2>
+  <pre id="out-webgpu">测量中…</pre>
+</section>
+
+<section id="sec-canvas2d">
+  <h2>Canvas 2D / OffscreenCanvas（渐变、裁剪、重复、toDataURL/toBlob/convertToBlob/PNG 解码、错误与 taint）</h2>
+  <pre id="out-canvas2d">测量中…</pre>
+</section>
+
+<section id="sec-float16">
+  <h2>float16 画布（原生精度，不做 RGBA8 强制转换）</h2>
+  <pre id="out-float16">测量中…</pre>
+</section>
+
+<section id="sec-audio">
+  <h2>音频（OfflineAudioContext / live AudioBuffer 写入语义）</h2>
+  <pre id="out-audio">测量中…</pre>
+</section>
+
+<section id="sec-fonts">
+  <h2>字体（真实测量、允许集合、已安装非允许候选、远程 Ahem web font、queryLocalFonts）</h2>
+  <pre id="out-fonts">测量中…</pre>
+</section>
+
+<section id="sec-webrtc">
+  <h2>WebRTC（仅 loopback，无外部 STUN/TURN 的 ICE 候选）</h2>
+  <pre id="out-webrtc">测量中…</pre>
+</section>
+
+<section id="sec-network">
+  <h2>网络请求（/echo、/accept-ch、/redirect 与 JS getHighEntropyValues 对照）</h2>
+  <pre id="out-network">测量中…</pre>
+</section>
+
+<section id="sec-checks">
+  <h2>检查汇总（check 仅覆盖实际执行过的项；未运行/不支持一律不算通过）</h2>
+  <div id="checks-host">汇总中…</div>
+</section>
+
+<section id="sec-cleanup">
+  <h2>资源清理</h2>
+  <pre id="out-cleanup">待清理。</pre>
+</section>
+
+<footer>fixture 说明：window.irisProbe 为 Promise，resolve 原始测量报告（raw 数据 + 非空 checks）；
+失败与不支持项均保留证据。本页面仅测量，不修改任何浏览器原生行为。</footer>
+
+<script>
+/* 表单处理独立于 probe.js：即使测量失败，真实提交路径仍然可用。 */
+(function () {
+  'use strict';
+  var form = document.getElementById('demo-form');
+  var result = document.getElementById('form-result');
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    var value = document.getElementById('name').value;
+    result.textContent = '提交中（POST /submit，name=' + JSON.stringify(value) + '）…';
+    fetch('/submit', { method: 'POST', body: new URLSearchParams({ name: value }) })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (out) {
+        result.textContent = 'HTTP ' + out.status + ' 服务器回显: ' + JSON.stringify(out.body);
+        if (typeof window.__irisSubmitResolve === 'function') window.__irisSubmitResolve(out.body);
+      })
+      .catch(function (err) {
+        result.textContent = '提交失败: ' + (err && err.message ? err.message : String(err));
+        if (typeof window.__irisSubmitResolve === 'function')
+          window.__irisSubmitResolve({ error: err && err.message ? err.message : String(err) });
+      });
+  });
+})();
+</script>
+</body>
+</html>

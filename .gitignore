@@ -1,0 +1,23 @@
+/out/
+/dist/
+/target/
+/node_modules/
+__pycache__/
+*.pyc
+
+# MSVC/Windows 中间产物（正式输出只进 out/、dist/）
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+*.zip
+*.zip.sha256
+
+# IDE 目录与 Windows 事故文件
+.vs/
+CMakeFiles/
+CMakeCache.txt
+nul

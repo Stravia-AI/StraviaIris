@@ -1,0 +1,15 @@
+[package]
+name = "iris-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+iris = { path = "../../crates/iris" }
+base64 = "=0.22.1"
+
+[build-dependencies]
+serde_json.workspace = true

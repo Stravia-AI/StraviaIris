@@ -1,0 +1,30 @@
+StraviaIris 编解码构建与许可边界
+
+构建配置
+本项目在 engine.lock.json 固定 proprietary_codecs=true、ffmpeg_branding="Chrome"。
+Windows 构建使用固定 Chromium 源码依赖中的 FFmpeg，并启用随源码构建的
+OpenH264 软件 H.264 编码路径。能力查询保留原生结果，不把不支持的录制或
+MediaSource 格式改报为支持。
+
+许可材料
+完整分发保留固定 CEF make_distrib 生成的 licenses/cef/LICENSE.txt 和
+licenses/cef/CREDITS.html。CREDITS.html 包含 FFmpeg 的许可说明和 OpenH264
+的 Cisco BSD-2-Clause 版权、许可条件及免责声明。不得删除这些材料。
+FFmpeg 的整体许可适用 LGPL v2.1+，相关文件还包含 BSD、MIT、ISC 等许可；
+准确范围与原文以固定源码及该 CREDITS.html 为准。
+
+OpenH264 专利边界
+本项目自行编译 OpenH264，不是由终端用户从 Cisco 单独下载的官方二进制。
+不能仅因使用 OpenH264 或遵守 BSD 许可，就主张满足 Cisco 官方二进制的
+AVC/H.264 专利许可条件。Cisco 公布的二进制许可与条件见：
+https://www.openh264.org/BINARY_LICENSE.txt
+https://www.openh264.org/faq.html
+
+对外分发与使用
+启用构建开关、编解码测试通过以及保留开源版权材料，均不等于取得适用于
+所有司法辖区、用途或商业模式的编解码专利授权。对外分发前，应自行确认
+适用的专利许可，以及 FFmpeg LGPL 对对应源码、构建和重新链接材料等的
+要求。engine.lock.json、补丁及构建工具固定了重建输入；提供源码下载入口
+本身不构成所有分发义务均已履行的保证。
+
+本说明不提供额外专利授权，也不替代任何组件的原始许可条款。

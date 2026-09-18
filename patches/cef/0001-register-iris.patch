@@ -1,0 +1,24 @@
+目的：在固定 CEF 上游队列末尾注册全部八个 StraviaIris 补丁。
+来源：https://github.com/chromiumembedded/cef/blob/708dc140cbc3286826a8abef89dc23a44ff9ea72/patch/patch.cfg
+许可：保留 CEF BSD 许可。
+验收：engine.py apply/check-replay 验证完整注册顺序和目标摘要；缺失任何补丁禁止构建。
+
+diff --git patch/patch.cfg patch/patch.cfg
+--- patch/patch.cfg
++++ patch/patch.cfg
+@@ -900,5 +900,14 @@
+   {
+     # Guard background extensions dependency on enable_background_mode.
+     'name': 'chrome_browser_extensions_background',
+-  }
++  },
++  # StraviaIris 原生行为；上游补丁全部在前，顺序是构建契约。
++  { 'name': 'iris_000_profile' },
++  { 'name': 'iris_010_identity' },
++  { 'name': 'iris_020_canvas' },
++  { 'name': 'iris_030_gpu' },
++  { 'name': 'iris_040_audio' },
++  { 'name': 'iris_050_fonts' },
++  { 'name': 'iris_060_screen_timezone_webrtc' },
++  { 'name': 'iris_070_engine_identity' },
+ ]

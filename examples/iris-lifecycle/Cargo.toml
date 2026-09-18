@@ -1,0 +1,13 @@
+[package]
+name = "iris-lifecycle"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+iris = { path = "../../crates/iris" }
+
+[build-dependencies]
+serde_json.workspace = true

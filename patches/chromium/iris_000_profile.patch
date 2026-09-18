@@ -1,0 +1,764 @@
+目的：固定桌面画像并按 Owl 上下文种子派生编码导出像素扰动；不修改读取路径
+来源：原创 StraviaIris；CEF https://github.com/chromiumembedded/cef/tree/708dc140cbc3286826a8abef89dc23a44ff9ea72
+基线：https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：新增组件 BSD-3-Clause；Chromium、CEF、ANGLE 修改保留各自原有许可。
+输入：固定提交与 Windows profile；不改宿主原型、不注入伪装脚本、不改变 CEF 公共 API hash。
+验收要求：画像可生成；RGBA 与 BGRA 导出匹配参考掩码，保留行间距、半透明像素、通道边界及浮点格式
+
+diff --git cef/BUILD.gn cef/BUILD.gn
+index 3e7b547f586b19b95542f847dbb37d919df60eb7..a8c7c0781e550fb9605427757dc84d61a5ca05be 100644
+--- cef/BUILD.gn
++++ cef/BUILD.gn
+@@ -965,6 +965,7 @@ source_set("libcef_static") {
+     "//components/content_settings/core/common",
+     "//components/crx_file",
+     "//components/google/core/common",
++    "//components/iris",
+     "//components/keyed_service/content:content",
+     "//components/keyed_service/core:core",
+     "//components/media_router/common/mojom:media_router",
+diff --git cef/libcef/common/chrome/chrome_main_delegate_cef.cc cef/libcef/common/chrome/chrome_main_delegate_cef.cc
+index d2cda1d5bef4237f95065187bd94e9072cf5a8dd..8ea25052b2b3ec351f1153c9b0f7d797bcc0f219 100644
+--- cef/libcef/common/chrome/chrome_main_delegate_cef.cc
++++ cef/libcef/common/chrome/chrome_main_delegate_cef.cc
+@@ -29,6 +29,8 @@
+ #include "chrome/common/pref_names.h"
+ #include "components/autofill/core/common/autofill_features.h"
+ #include "components/embedder_support/switches.h"
++#include "components/iris/engine_protocol.h"
++#include "components/iris/profile.h"
+ #include "components/lens/lens_features.h"
+ #include "components/variations/service/buildflags.h"
+ #include "content/common/features.h"
+@@ -36,6 +38,7 @@
+ #include "net/base/features.h"
+ #include "sandbox/policy/switches.h"
+ #include "third_party/blink/public/common/switches.h"
++#include "third_party/icu/source/i18n/unicode/timezone.h"
+ #include "ui/base/ui_base_paths.h"
+ #include "ui/base/ui_base_switches.h"
+ 
+@@ -400,6 +403,22 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
+     std::ignore = commandLinePtr->Detach(nullptr);
+   }
+ 
++  // 在应用填充命令行之后、任何脚本上下文和工作线程之前冻结进程配置。
++  for (const auto& entry : command_line->GetSwitches()) {
++    if (entry.first.starts_with("iris-") &&
++        entry.first != iris_engine::kSeedSwitch &&
++        entry.first != iris_engine::kTimezoneSwitch) {
++      return iris_engine::kInvalidArgumentExit;
++    }
++  }
++  if (command_line->HasSwitch(embedder_support::kUserAgent) ||
++      command_line->HasSwitch(switches::kUserAgentProductAndVersion) ||
++      !iris::InitializeProcess(
++          command_line->GetSwitchValueUTF8(iris_engine::kSeedSwitch),
++          command_line->GetSwitchValueUTF8(iris_engine::kTimezoneSwitch))) {
++    return iris_engine::kInvalidArgumentExit;
++  }
++
+   // Call as early as possible.
+   InitLogging(command_line);
+ 
+@@ -514,6 +533,19 @@ std::variant<int, content::MainFunctionParams>
+ ChromeMainDelegateCef::RunProcess(
+     const std::string& process_type,
+     content::MainFunctionParams main_function_params) {
++  // BasicStartupComplete 时 ICU 尚未初始化；在所有进程的实际入口前校验，
++  // 不把未知 ID 静默映射到 GMT。这里只校验，不修改宿主系统时区。
++  const auto& timezone = iris::GetRuntimeConfig().timezone;
++  if (!timezone.empty()) {
++    UErrorCode error = U_ZERO_ERROR;
++    UBool is_system_id = false;
++    icu::UnicodeString canonical;
++    icu::TimeZone::getCanonicalID(icu::UnicodeString::fromUTF8(timezone),
++                                canonical, is_system_id, error);
++    if (U_FAILURE(error) || !is_system_id) {
++      return iris_engine::kInvalidArgumentExit;
++    }
++  }
+   if (process_type.empty()) {
+     return runner_->RunMainProcess(std::move(main_function_params));
+   }
+diff --git components/iris/BUILD.gn components/iris/BUILD.gn
+new file mode 100644
+index 0000000000000000000000000000000000000000..42cebcc351ef55f76dbba47fbfe622149721b402
+--- /dev/null
++++ components/iris/BUILD.gn
+@@ -0,0 +1,79 @@
++# Copyright 2026 StraviaIris contributors
++# SPDX-License-Identifier: BSD-3-Clause
++
++import("//testing/test.gni")
++
++config("headers") {
++  include_dirs = [
++    "//",
++    root_gen_dir,
++  ]
++}
++
++action("generate_engine_identity") {
++  script = "generate_engine_identity.py"
++  inputs = [ "engine_build_id.txt" ]
++  outputs = [ "$target_gen_dir/engine_build_id.h" ]
++  args = [
++    "--input",
++    rebase_path(inputs[0], root_build_dir),
++    "--output",
++    rebase_path(outputs[0], root_build_dir),
++  ]
++}
++
++action("generate_profile") {
++  script = "generate_profile.py"
++  inputs = [
++    "profile.json",
++    "engine.lock.json",
++    "//chrome/VERSION",
++  ]
++  outputs = [ "$target_gen_dir/profile_data.h" ]
++  args = [
++    "--profile",
++    rebase_path("profile.json", root_build_dir),
++    "--lock",
++    rebase_path("engine.lock.json", root_build_dir),
++    "--version",
++    rebase_path("//chrome/VERSION", root_build_dir),
++    "--output",
++    rebase_path(outputs[0], root_build_dir),
++  ]
++}
++
++source_set("iris") {
++  sources = [
++    "noise.h",
++    "profile.cc",
++    "profile.h",
++    "$target_gen_dir/profile_data.h",
++    "$target_gen_dir/engine_build_id.h",
++  ]
++  public_deps = [
++    ":generate_engine_identity",
++    ":generate_profile",
++  ]
++  deps = [ "//base" ]
++  public_configs = [ ":headers" ]
++}
++
++source_set("skia_pixels") {
++  sources = [
++    "skia_pixels.cc",
++    "skia_pixels.h",
++  ]
++  public_deps = [
++    ":iris",
++    "//skia",
++  ]
++}
++
++test("iris_unittests") {
++  sources = [ "noise_unittest.cc" ]
++  deps = [
++    ":skia_pixels",
++    "//base/test:run_all_unittests",
++    "//testing/gtest",
++  ]
++}
+diff --git components/iris/DEPS components/iris/DEPS
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8874b5d97509fb41b95f53391709c143bfaa4de
+--- /dev/null
++++ components/iris/DEPS
+@@ -0,0 +1,5 @@
++include_rules = [
++  "+third_party/skia/include/core",
++]
++
++
+diff --git components/iris/generate_engine_identity.py components/iris/generate_engine_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a02b902d0347bc1d0f7434193b0db6019e2249b
+--- /dev/null
++++ components/iris/generate_engine_identity.py
+@@ -0,0 +1,32 @@
++# Copyright 2026 StraviaIris contributors
++# SPDX-License-Identifier: BSD-3-Clause
++"""将构建驱动计算的输入摘要转成编译期常量，不参与其自身摘要。"""
++
++import argparse
++from pathlib import Path
++import re
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--input", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    args = parser.parse_args()
++    build_id = args.input.read_text(encoding="ascii").strip()
++    if not re.fullmatch(r"[0-9a-f]{64}", build_id):
++        parser.error("engine build ID must be a lowercase SHA-256 digest")
++    content = (
++        "// Generated from the engine build input digest; do not edit.\n"
++        "#ifndef COMPONENTS_IRIS_ENGINE_BUILD_ID_H_\n"
++        "#define COMPONENTS_IRIS_ENGINE_BUILD_ID_H_\n\n"
++        "namespace iris::profile {\n"
++        f'inline constexpr char kEngineBuildId[] = "{build_id}";\n'
++        "}  // namespace iris::profile\n\n"
++        "#endif  // COMPONENTS_IRIS_ENGINE_BUILD_ID_H_\n"
++    )
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    args.output.write_text(content, encoding="utf-8", newline="\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git components/iris/generate_profile.py components/iris/generate_profile.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b07bfd1f4266076fbeceaaa11e22d854db33bcf
+--- /dev/null
++++ components/iris/generate_profile.py
+@@ -0,0 +1,190 @@
++# Copyright 2026 StraviaIris contributors
++# SPDX-License-Identifier: BSD-3-Clause
++"""从唯一 profile 和已核实的 Chromium VERSION 生成原生常量。"""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++
++STRINGS = {
++    "id": "kId",
++    "platform": "kPlatform",
++    "user_agent.platform": "kUaPlatform",
++    "user_agent.platform_version": "kUaPlatformVersion",
++    "user_agent.architecture": "kUaArchitecture",
++    "user_agent.bitness": "kUaBitness",
++    "screen.orientation": "kScreenOrientation",
++    "webgl.vendor": "kWebGlVendor",
++    "webgl.renderer": "kWebGlRenderer",
++    "webgpu.vendor": "kWebGpuVendor",
++    "webgpu.architecture": "kWebGpuArchitecture",
++    "webgpu.device": "kWebGpuDevice",
++    "webgpu.description": "kWebGpuDescription",
++    "connection.effective_type": "kConnectionEffectiveType",
++    "generic_fonts.standard": "kStandardFont",
++    "generic_fonts.serif": "kSerifFont",
++    "generic_fonts.sans_serif": "kSansSerifFont",
++    "generic_fonts.monospace": "kMonospaceFont",
++    "generic_fonts.cursive": "kCursiveFont",
++    "generic_fonts.fantasy": "kFantasyFont",
++    "generic_fonts.math": "kMathFont",
++}
++INTEGERS = {
++    "profile_version": "kProfileVersion",
++    "hardware_concurrency": "kHardwareConcurrency",
++    "device_memory": "kDeviceMemory",
++    "device_memory_header": "kDeviceMemoryHeader",
++    "max_touch_points": "kMaxTouchPoints",
++    "connection.rtt_ms": "kConnectionRttMs",
++    "screen.width": "kScreenWidth",
++    "screen.height": "kScreenHeight",
++    "screen.available_width": "kAvailableWidth",
++    "screen.available_height": "kAvailableHeight",
++    "screen.color_depth": "kColorDepth",
++    "screen.pixel_depth": "kPixelDepth",
++    "screen.depth_per_component": "kDepthPerComponent",
++    "screen.viewport_width": "kViewportWidth",
++    "screen.viewport_height": "kViewportHeight",
++    "screen.inner_width": "kInnerWidth",
++    "screen.inner_height": "kInnerHeight",
++    "screen.outer_width": "kOuterWidth",
++    "screen.outer_height": "kOuterHeight",
++    "audio_sample_rate": "kAudioSampleRate",
++}
++INT64S = {
++    "storage_quota": "kStorageQuota",
++}
++DOUBLES = {
++    "connection.downlink_mbps": "kConnectionDownlinkMbps",
++}
++BOOLEANS = {"user_agent.mobile": "kMobile", "user_agent.wow64": "kWow64",
++            "prefers_reduced_motion": "kPrefersReducedMotion",
++            "connection.save_data": "kConnectionSaveData"}
++ARRAYS = {"languages": "kLanguages", "fonts": "kFontFamilies",
++          "webgpu.features": "kWebGpuFeatures"}
++
++
++def value_at(data, key):
++    value = data
++    for part in key.split("."):
++        value = value[part]
++    return value
++
++
++def literal(value, *, allow_empty=False):
++    if not isinstance(value, str) or (not value and not allow_empty) or "\0" in value:
++        raise ValueError("profile 字符串无效：禁止 NUL，仅可选 GPU 信息允许为空")
++    # JSON 和 C++ 对当前 profile 所用字符采用相同的字面量转义。
++    if not value.isascii():
++        raise ValueError("当前 Windows desktop profile 使用 ASCII 身份和字体名称")
++    return json.dumps(value, ensure_ascii=True)
++
++
++def generate(profile, lock, version_text):
++    expected = set(STRINGS) | set(INTEGERS) | set(INT64S) | set(DOUBLES) | set(BOOLEANS) | set(ARRAYS)
++    expected |= {"schema_version", "screen.device_scale_factor"}
++
++    def leaves(value, prefix=""):
++        for key, child in value.items():
++            path = f"{prefix}.{key}" if prefix else key
++            if isinstance(child, dict):
++                yield from leaves(child, path)
++            else:
++                yield path
++
++    if set(leaves(profile)) != expected:
++        raise ValueError("profile 字段与唯一原生 schema 不一致")
++    if (type(profile["schema_version"]) is not int or
++            profile["schema_version"] != 1 or
++            profile["id"] != "windows-desktop"):
++        raise ValueError("不支持的 profile schema 或 ID")
++    version = dict(line.split("=", 1) for line in version_text.splitlines() if line)
++    parts = [version[key] for key in ("MAJOR", "MINOR", "BUILD", "PATCH")]
++    if not all(part.isascii() and part.isdecimal() for part in parts):
++        raise ValueError("Chromium VERSION 不是四段十进制版本")
++    full_version = ".".join(parts)
++    if lock["chromium"]["tag"] != f"refs/tags/{full_version}":
++        raise ValueError("Chromium VERSION 与锁定版本不一致")
++    lines = [
++        "// 由 generate_profile.py 生成；修改唯一 profile JSON，不手工编辑。",
++        "#ifndef COMPONENTS_IRIS_PROFILE_DATA_H_",
++        "#define COMPONENTS_IRIS_PROFILE_DATA_H_",
++        "#include <array>",
++        "#include <cstdint>",
++        "#include <string_view>",
++        "namespace iris::profile {",
++        f"inline constexpr std::string_view kFullVersion = {literal(full_version)};",
++        f"inline constexpr int kMajorVersion = {int(parts[0])};",
++    ]
++    for key, name in STRINGS.items():
++        # GPUAdapterInfo 允许不公开这些可选标识，不能用宿主信息填补。
++        allow_empty = key in {"webgpu.architecture", "webgpu.device", "webgpu.description"}
++        value = literal(value_at(profile, key), allow_empty=allow_empty)
++        lines.append(f"inline constexpr std::string_view {name} = {value};")
++    for key, name in INTEGERS.items():
++        value = value_at(profile, key)
++        if type(value) is not int or not 0 <= value <= 0x7fffffff:
++            raise ValueError(f"{key} 不是非负 int32")
++        lines.append(f"inline constexpr int {name} = {value};")
++    for key, name in INT64S.items():
++        value = value_at(profile, key)
++        if type(value) is not int or not 0 <= value <= 0x7fffffffffffffff:
++            raise ValueError(f"{key} 不是非负 int64")
++        lines.append(f"inline constexpr std::int64_t {name} = {value};")
++    for key, name in DOUBLES.items():
++        value = value_at(profile, key)
++        if type(value) not in (int, float) or not 0 <= float(value) <= 1e308:
++            raise ValueError(f"{key} 不是非负 double")
++        lines.append(f"inline constexpr double {name} = {float(value)!r};")
++    for key, name in BOOLEANS.items():
++        value = value_at(profile, key)
++        if type(value) is not bool:
++            raise ValueError(f"{key} 不是 bool")
++        lines.append(f"inline constexpr bool {name} = {str(value).lower()};")
++    for key, name in ARRAYS.items():
++        values = value_at(profile, key)
++        if not isinstance(values, list) or not values or len(values) != len(set(values)):
++            raise ValueError(f"{key} 不是非空且不重复的字符串数组")
++        elements = ", ".join(literal(value) for value in values)
++        lines.append(f"inline constexpr std::array<std::string_view, {len(values)}> {name} = {{{elements}}};")
++    fonts = profile["fonts"]
++    if any(font not in fonts for font in profile["generic_fonts"].values()):
++        raise ValueError("generic family 不在允许的实际字体集合内")
++    wide_fonts = ", ".join("u" + literal(font) for font in fonts)
++    lines.append(f"inline constexpr std::array<std::u16string_view, {len(fonts)}> kFontFamiliesUtf16 = {{{wide_fonts}}};")
++    languages = ",".join(profile["languages"])
++    lines.append(f"inline constexpr std::string_view kAcceptLanguage = {literal(languages)};")
++    scale = profile["screen"]["device_scale_factor"]
++    if type(scale) not in (int, float) or not 0 < scale <= 8:
++        raise ValueError("无效 device scale factor")
++    lines.append(f"inline constexpr double kDeviceScaleFactor = {float(scale)!r};")
++    screen = profile["screen"]
++    if not (0 < screen["available_width"] <= screen["width"] and
++            0 < screen["available_height"] <= screen["height"] and
++            all(screen[key] > 0 for key in (
++                "viewport_width", "viewport_height", "inner_width",
++                "inner_height", "outer_width", "outer_height"))):
++        raise ValueError("屏幕和 viewport 尺寸不一致")
++    if not 0 < screen["depth_per_component"] * 3 <= screen["color_depth"]:
++        raise ValueError("RGB 分量位深与总位深不一致")
++    lines += ["}  // namespace iris::profile", "#endif  // COMPONENTS_IRIS_PROFILE_DATA_H_", ""]
++    return "\n".join(lines)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    for option in ("profile", "lock", "version", "output"):
++        parser.add_argument(f"--{option}", type=Path, required=True)
++    args = parser.parse_args()
++    result = generate(json.loads(args.profile.read_text(encoding="utf-8")),
++                      json.loads(args.lock.read_text(encoding="utf-8")),
++                      args.version.read_text(encoding="utf-8"))
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    if not args.output.exists() or args.output.read_text(encoding="utf-8") != result:
++        args.output.write_text(result, encoding="utf-8", newline="\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git components/iris/noise.h components/iris/noise.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad790f1c54bc104bdd287f47161044645fcb19bd
+--- /dev/null
++++ components/iris/noise.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_IRIS_NOISE_H_
++#define COMPONENTS_IRIS_NOISE_H_
++
++#include <cstdint>
++
++namespace iris {
++
++constexpr uint64_t Mix64(uint64_t value) {
++  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
++  return value ^ (value >> 31);
++}
++
++// 只依赖导出图像坐标，不依赖尺寸、内容或渲染上下文类型。
++constexpr uint32_t CanvasPixelHash(uint64_t seed, uint32_t x, uint32_t y) {
++  uint64_t value = seed ^ (uint64_t{x} * 0x517cc1b727220a95ULL) ^
++                   (uint64_t{y} * 0x6c62272e07bb0142ULL);
++  value = (value ^ (value >> 33)) * 0xff51afd7ed558ccdULL;
++  value = (value ^ (value >> 33)) * 0xc4ceb9fe1a85ec53ULL;
++  return static_cast<uint32_t>(value ^ (value >> 33));
++}
++
++inline uint32_t CanvasNoiseThreshold(uint64_t seed) {
++  const uint32_t folded = static_cast<uint32_t>(
++      seed ^ (seed >> 16) ^ (seed >> 32));
++  // 单精度舍入是参考阈值的一部分，不能改成整数近似或双精度。
++  return static_cast<uint32_t>(
++      (static_cast<float>(folded % 200) / 100000.0f + 0.003f) * 10000.0f);
++}
++
++}  // namespace iris
++
++#endif  // COMPONENTS_IRIS_NOISE_H_
+diff --git components/iris/noise_unittest.cc components/iris/noise_unittest.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd5e5a99f6ab4372b4324480b28ef735a44e661c
+--- /dev/null
++++ components/iris/noise_unittest.cc
+@@ -0,0 +1,93 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/iris/skia_pixels.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++#include "third_party/skia/include/core/SkPixmap.h"
++
++namespace iris {
++namespace {
++
++constexpr int kWidth = 128;
++constexpr int kHeight = 5;
++constexpr size_t kRowBytes = kWidth * 4 + 16;
++constexpr uint64_t kReferenceCanvasSeed = 0xe1d12aa82badc1cfULL;
++using Pixels = std::array<uint8_t, kRowBytes * kHeight>;
++
++Pixels MakePixels(std::array<uint8_t, 4> color) {
++  Pixels pixels;
++  pixels.fill(0xa5);
++  for (int y = 0; y < kHeight; ++y) {
++    for (int x = 0; x < kWidth; ++x) {
++      std::copy(color.begin(), color.end(),
++                pixels.begin() + y * kRowBytes + x * 4);
++    }
++  }
++  return pixels;
++}
++
++TEST(IrisCanvasExportTest, MatchesReferencePixelsWithoutChangingRowPadding) {
++  auto pixels = MakePixels({101, 123, 147, 255});
++  auto expected = pixels;
++  // 来自独立运行的 Owl profile118/seed42 的完整 128×5 导出区域。
++  --expected[14 * 4 + 2];
++  ++expected[105 * 4];
++  --expected[2 * kRowBytes + 50 * 4 + 1];
++  ++expected[4 * kRowBytes + 42 * 4];
++  const SkPixmap pixmap(
++      SkImageInfo::Make(kWidth, kHeight, kRGBA_8888_SkColorType,
++                        kUnpremul_SkAlphaType),
++      pixels.data(), kRowBytes);
++  EXPECT_TRUE(PerturbSkPixmap(pixmap, kReferenceCanvasSeed));
++  EXPECT_EQ(pixels, expected);
++}
++
++TEST(IrisCanvasExportTest, BgraPreservesAlphaAndSkipsChannelOverflow) {
++  auto pixels = MakePixels({147, 123, 101, 255});
++  pixels[14 * 4] = 0;
++  pixels[105 * 4 + 2] = 255;
++  pixels[2 * kRowBytes + 50 * 4 + 3] = 254;
++  auto expected = pixels;
++  ++expected[4 * kRowBytes + 42 * 4 + 2];
++  const SkPixmap pixmap(
++      SkImageInfo::Make(kWidth, kHeight, kBGRA_8888_SkColorType,
++                        kUnpremul_SkAlphaType),
++      pixels.data(), kRowBytes);
++  EXPECT_TRUE(PerturbSkPixmap(pixmap, kReferenceCanvasSeed));
++  EXPECT_EQ(pixels, expected);
++}
++
++TEST(IrisCanvasExportTest, LeavesFloat16AndDisabledNoiseUnchanged) {
++  std::array<uint16_t, kWidth * kHeight * 4> halves;
++  for (size_t index = 0; index < halves.size(); index += 4) {
++    halves[index] = 0x3001;
++    halves[index + 1] = 0x3401;
++    halves[index + 2] = 0x3801;
++    halves[index + 3] = 0x3c00;
++  }
++  const auto expected_halves = halves;
++  const SkPixmap half_pixmap(
++      SkImageInfo::Make(kWidth, kHeight, kRGBA_F16_SkColorType,
++                        kUnpremul_SkAlphaType),
++      halves.data(), kWidth * 8);
++  EXPECT_FALSE(PerturbSkPixmap(half_pixmap, kReferenceCanvasSeed));
++  EXPECT_EQ(halves, expected_halves);
++
++  auto pixels = MakePixels({101, 123, 147, 255});
++  const auto expected_pixels = pixels;
++  const SkPixmap byte_pixmap(
++      SkImageInfo::Make(kWidth, kHeight, kRGBA_8888_SkColorType,
++                        kUnpremul_SkAlphaType),
++      pixels.data(), kRowBytes);
++  EXPECT_FALSE(PerturbSkPixmap(byte_pixmap, 0));
++  EXPECT_EQ(pixels, expected_pixels);
++}
++
++}  // namespace
++}  // namespace iris
+diff --git components/iris/profile.cc components/iris/profile.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..105940f899ee478ee58294369581acaacd8b6f2f
+--- /dev/null
++++ components/iris/profile.cc
+@@ -0,0 +1,74 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/iris/profile.h"
++
++#include <charconv>
++#include <random>
++#include <system_error>
++
++#include "base/check.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "components/iris/noise.h"
++
++namespace iris {
++namespace {
++
++// 在线程启动前发布；之后没有写入，也不为逐像素计算引入原子同步。
++const RuntimeConfig* g_runtime_config = nullptr;
++
++uint64_t CanvasSeed(uint64_t seed) {
++  if (seed == 0) {
++    return 0;
++  }
++  std::mt19937_64 generator(seed);
++  const uint64_t context = generator();
++  // 参考使用固定的 ctx_%016llx 标识和非标准 FNV 偏移量。
++  // 直接折叠十六进制字符，避免构造字符串；仅在进程初始化时派生。
++  uint64_t hash = 0x14650fb0739d0383ULL;
++  for (char value : std::string_view("ctx_")) {
++    hash = (hash ^ value) * 0x100000001b3ULL;
++  }
++  constexpr char kHex[] = "0123456789abcdef";
++  for (int shift = 60; shift >= 0; shift -= 4) {
++    hash = (hash ^ kHex[(context >> shift) & 15]) * 0x100000001b3ULL;
++  }
++  hash ^= 20;
++  if (hash == 0) {
++    hash = 0xa5a5a5a5a5a5a5a5ULL;
++  }
++  return Mix64(hash + 0x9e3779b97f4a7c15ULL);
++}
++
++}  // namespace
++
++bool InitializeProcess(std::string_view seed, std::string_view timezone) {
++  if (g_runtime_config || seed.empty() ||
++      timezone.find('\0') != std::string_view::npos ||
++      !base::IsStringUTF8(timezone)) {
++    return false;
++  }
++  uint64_t parsed_seed = 0;
++  const auto [end, error] =
++      std::from_chars(seed.data(), seed.data() + seed.size(), parsed_seed, 10);
++  if (error != std::errc{} || end != seed.data() + seed.size()) {
++    return false;
++  }
++  static const base::NoDestructor<RuntimeConfig> config(parsed_seed,
++                                                        CanvasSeed(parsed_seed),
++                                                        std::string(timezone));
++  g_runtime_config = config.get();
++  return true;
++}
++
++const RuntimeConfig& GetRuntimeConfig() {
++  CHECK(g_runtime_config);
++  return *g_runtime_config;
++}
++
++std::string_view GetTimezoneOverride() {
++  return g_runtime_config ? g_runtime_config->timezone : std::string_view();
++}
++
++}  // namespace iris
+diff --git components/iris/profile.h components/iris/profile.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..47b33529676087a4dee14fb9e55467087338eeb3
+--- /dev/null
++++ components/iris/profile.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_IRIS_PROFILE_H_
++#define COMPONENTS_IRIS_PROFILE_H_
++
++#include <cstdint>
++#include <string>
++#include <string_view>
++
++#include "components/iris/profile_data.h"
++
++namespace iris {
++
++struct RuntimeConfig {
++  uint64_t seed;
++  uint64_t canvas_seed;
++  std::string timezone;
++};
++
++// 仅供进程启动主线程调用，须先于 renderer/worker/GPU 工作线程。
++// 十进制 seed 必须完整且不溢出；0 合法。重复初始化失败，不改变既有配置。
++// timezone 的 ICU 校验由 ICU 初始化后的原有启动层完成。
++bool InitializeProcess(std::string_view seed, std::string_view timezone);
++
++// 成功 InitializeProcess 后才可访问；返回值在进程退出前不可变且保持有效。
++const RuntimeConfig& GetRuntimeConfig();
++
++// 显式时区可选；未初始化运行配置的构建工具没有 override。
++// 非空返回值借用进程生命周期内不可变的配置，不允许借此读取默认 seed。
++std::string_view GetTimezoneOverride();
++
++}  // namespace iris
++
++#endif  // COMPONENTS_IRIS_PROFILE_H_
+diff --git components/iris/skia_pixels.cc components/iris/skia_pixels.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a728fa1cdf7c521a64ded70c3228adf8cd81b724
+--- /dev/null
++++ components/iris/skia_pixels.cc
+@@ -0,0 +1,58 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "components/iris/skia_pixels.h"
++
++#include <bit>
++
++#include "components/iris/noise.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++#include "third_party/skia/include/core/SkPixmap.h"
++
++namespace iris {
++
++bool PerturbSkPixmap(const SkPixmap& pixmap, uint64_t canvas_seed) {
++  static_assert(std::endian::native == std::endian::little);
++  if (canvas_seed == 0 || pixmap.width() <= 0 || pixmap.height() <= 0 ||
++      !pixmap.addr()) {
++    return false;
++  }
++  const SkColorType type = pixmap.colorType();
++  if (type != kRGBA_8888_SkColorType && type != kRGB_888x_SkColorType &&
++      type != kBGRA_8888_SkColorType) {
++    return false;
++  }
++  if (pixmap.rowBytes() < static_cast<size_t>(pixmap.width()) * 4 ||
++      SkImageInfo::ByteSizeOverflowed(pixmap.computeByteSize())) {
++    return false;
++  }
++
++  const uint32_t threshold = CanvasNoiseThreshold(canvas_seed);
++  bool changed = false;
++  for (int y = 0; y < pixmap.height(); ++y) {
++    auto* row = static_cast<uint8_t*>(pixmap.writable_addr(0, y));
++    for (int x = 0; x < pixmap.width(); ++x) {
++      uint8_t* pixel = row + static_cast<size_t>(x) * 4;
++      if (pixel[3] != 255) {
++        continue;
++      }
++      const uint32_t hash = CanvasPixelHash(canvas_seed, x, y);
++      if (hash % 10000 >= threshold) {
++        continue;
++      }
++      uint32_t channel = (hash >> 16) % 3;
++      if (type == kBGRA_8888_SkColorType) {
++        channel = 2 - channel;
++      }
++      const int value = pixel[channel] + ((hash & 0x100000) ? 1 : -1);
++      if (value < 0 || value > 255) {
++        continue;
++      }
++      pixel[channel] = static_cast<uint8_t>(value);
++      changed = true;
++    }
++  }
++  return changed;
++}
++
++}  // namespace iris
+diff --git components/iris/skia_pixels.h components/iris/skia_pixels.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ff750d8aec19f2dbb7ab44d86c4fbf49154492f
+--- /dev/null
++++ components/iris/skia_pixels.h
+@@ -0,0 +1,19 @@
++// Copyright 2026 StraviaIris contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef COMPONENTS_IRIS_SKIA_PIXELS_H_
++#define COMPONENTS_IRIS_SKIA_PIXELS_H_
++
++#include <cstdint>
++
++class SkPixmap;
++
++namespace iris {
++
++// pixmap 必须是编码器独占的副本，不能是画布或共享图像的 backing store。
++// 仅改变8位 RGB 中被选中的不透明像素；返回是否改动，false 不是编码错误。
++bool PerturbSkPixmap(const SkPixmap& pixmap, uint64_t canvas_seed);
++
++}  // namespace iris
++
++#endif  // COMPONENTS_IRIS_SKIA_PIXELS_H_

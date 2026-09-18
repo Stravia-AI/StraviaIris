@@ -1,0 +1,36 @@
+# StraviaIris::iris —— 已安装 SDK 的 CMake 包。
+#
+# 消费方（客户端 DLL）用法：
+#   find_package(StraviaIris CONFIG REQUIRED)
+#   target_link_libraries(my_client_dll PRIVATE StraviaIris::iris)
+#
+# 链接契约：
+#   - lib/stravia_iris.lib 是 bin/stravia_iris.dll 的导入库；wrapper、
+#     libcef、系统库与 delay-load 已由 SDK DLL 内部消化，消费方不再链接
+#     任何引擎产物；
+#   - 运行时 stravia_iris.dll 必须与客户端 DLL 同目录（分发组装器负责
+#     放入 runtime/）；libcef.dll 由引擎运行时文件提供；
+#   - 静态 CRT（/MT）：SDK DLL 与 CEF 分发
+#     CEF_RUNTIME_LIBRARY_FLAG=/MT 一致；调用方目标默认值在此设置。
+#
+# 版本兼容按引擎 build ID 判定（见 StraviaIrisConfigVersion.cmake）。
+
+@PACKAGE_INIT@
+
+if(NOT TARGET StraviaIris::iris)
+  add_library(StraviaIris::iris SHARED IMPORTED GLOBAL)
+  set_target_properties(StraviaIris::iris PROPERTIES
+    IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/bin/stravia_iris.dll"
+    IMPORTED_LOCATION_RELEASE "${PACKAGE_PREFIX_DIR}/bin/stravia_iris.dll"
+    IMPORTED_IMPLIB "${PACKAGE_PREFIX_DIR}/lib/stravia_iris.lib"
+    IMPORTED_IMPLIB_RELEASE "${PACKAGE_PREFIX_DIR}/lib/stravia_iris.lib"
+    IMPORTED_CONFIGURATIONS RELEASE
+  )
+  target_include_directories(StraviaIris::iris INTERFACE
+    "${PACKAGE_PREFIX_DIR}/include")
+endif()
+
+# 与 SDK 相同的静态 CRT 默认值；SDK DLL 封装 CRT 边界（不跨堆释放）。
+if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
