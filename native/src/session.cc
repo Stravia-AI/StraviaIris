@@ -25,6 +25,7 @@
 #include "include/cef_frame.h"
 #include "include/cef_parser.h"
 #include "include/cef_render_handler.h"
+#include "include/cef_request_context_handler.h"
 #include "include/cef_task.h"
 #include "include/cef_values.h"
 
@@ -88,6 +89,60 @@ CefRefPtr<CefValue> ParseJson(const std::string& text) {
 
 std::string WriteJson(CefRefPtr<CefValue> node) {
   return CefWriteJSON(node, JSON_WRITER_DEFAULT).ToString();
+}
+
+// 引擎补丁在 browser context 注册的 WebRTC 策略名：default 下发通配地址
+// 候选项，不暴露宿主真实 IP（无 mDNS responder 时为 0.0.0.0/::）。
+constexpr char kWebRtcIpHandlingPolicy[] = "webrtc.ip_handling_policy";
+
+// 向单个 request context 下发 WebRTC 策略；未注册或不可写时返回 false，
+// 绝不伪造一个未被消费的配置项。
+bool ApplyWebRtcPolicy(CefRequestContext* context) {
+  if (!context || !context->CanSetPreference(kWebRtcIpHandlingPolicy)) {
+    return false;
+  }
+  CefRefPtr<CefValue> value = CefValue::Create();
+  value->SetString("default");
+  CefString error;
+  return context->SetPreference(kWebRtcIpHandlingPolicy, value, error);
+}
+
+// Chromium 经 PathService::Override(_wfullpath) 把 user_data_dir 归一化
+// 为反斜杠绝对路径；具名 profile 的 cache_path 与其 DirName 是逐字符
+// 比较，因此本侧也必须用同一规则(GetFullPathNameW)归一化基路径，
+// 否则正斜杠输入会让 Chrome 静默降级为 OffTheRecord profile。
+// 失败返回空。
+std::wstring FullPathNameW(const std::wstring& path) {
+  const DWORD len = ::GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+  if (len == 0) {
+    return {};
+  }
+  std::wstring out(len, L'\0');
+  const DWORD written =
+      ::GetFullPathNameW(path.c_str(), len, out.data(), nullptr);
+  if (written == 0 || written >= len) {
+    return {};
+  }
+  out.resize(written);
+  return out;
+}
+
+// 具名 profile key：映射为 <cache>/iris-profile-<key>，不做转义或
+// 重编码，因此字符集必须是各文件系统都安全的子集：1..64 个 ASCII
+// 字母/数字/`-`/`_`。固定前缀使保留设备名、Chromium 内部目录都不会
+// 与 key 冲突，无需额外黑名单。
+bool ProfileKeyValid(const std::string& key) {
+  if (key.empty() || key.size() > 64) {
+    return false;
+  }
+  for (char c : key) {
+    const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_';
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -218,6 +273,24 @@ class IrisAppImpl final : public CefApp, public CefBrowserProcessHandler {
  private:
   SessionCore* core_;
   IMPLEMENT_REFCOUNTING(IrisAppImpl);
+};
+
+// 具名 profile context 的初始化回调：CreateContext 返回的 context 在
+// UI 线程异步初始化，完成后由此回调驱动偏好下发与挂起创建。
+class ProfileContextHandler final : public CefRequestContextHandler {
+ public:
+  ProfileContextHandler(SessionCore* core, std::string key)
+      : core_(core), key_(std::move(key)) {}
+
+  void OnRequestContextInitialized(
+      CefRefPtr<CefRequestContext> context) override {
+    core_->ProtectCallback([&] { core_->OnProfileContextInitialized(key_); });
+  }
+
+ private:
+  SessionCore* core_;
+  std::string key_;
+  IMPLEMENT_REFCOUNTING(ProfileContextHandler);
 };
 
 // ---------------------------------------------------------------------------
@@ -469,24 +542,11 @@ void SessionCore::OnContextInitialized() {
   context_initialized_ = true;
 
   // 原生策略 blink::kWebRTCIPHandlingDefault 对应的 preference
-  // 必须由引擎补丁在 browser context 注册；未注册或不可写时启动失败，
-  // 绝不伪造一个未被消费的配置项。default 下发通配地址候选项，
-  // 不暴露宿主真实 IP（无 mDNS responder 时为 0.0.0.0/::）。
-  constexpr char kWebRtcIpHandlingPolicy[] = "webrtc.ip_handling_policy";
-  CefRefPtr<CefRequestContext> context = CefRequestContext::GetGlobalContext();
-  if (!context || !context->CanSetPreference(kWebRtcIpHandlingPolicy)) {
-    std::fprintf(stderr, "iris: global request context %s: %s\n",
-                 context ? "cannot modify preference" : "unavailable",
+  // 必须由引擎补丁在 browser context 注册；未注册或不可写时启动失败。
+  // 具名 profile 的隔离上下文在 ResolveProfileContext 中执行同一下发。
+  if (!ApplyWebRtcPolicy(CefRequestContext::GetGlobalContext().get())) {
+    std::fprintf(stderr, "iris: cannot set %s on global request context\n",
                  kWebRtcIpHandlingPolicy);
-    FailRun(Status(IRIS_INITIALIZATION_FAILED));
-    return;
-  }
-  CefRefPtr<CefValue> value = CefValue::Create();
-  value->SetString("default");
-  CefString error;
-  if (!context->SetPreference(kWebRtcIpHandlingPolicy, value, error)) {
-    std::fprintf(stderr, "iris: cannot set %s: %s\n", kWebRtcIpHandlingPolicy,
-                 error.ToString().c_str());
     FailRun(Status(IRIS_INITIALIZATION_FAILED));
     return;
   }
@@ -628,11 +688,20 @@ void SessionCore::OnAfterCreated(CefRefPtr<CefBrowser> browser,
 
   const int cef_id = browser->GetIdentifier();
   try {
-    BrowserEntry entry;
-    entry.public_id = public_id;
+    auto it = browsers_.find(public_id);
+    if (it == browsers_.end()) {
+      // popup 路径：ID 在 OnBeforePopup 分配，此处才建档；显式创建的
+      // pending 条目已在 CreateBrowser 预登记。
+      BrowserEntry entry;
+      entry.public_id = public_id;
+      it = browsers_.emplace(public_id, std::move(entry)).first;
+    }
+    BrowserEntry& entry = it->second;
     entry.cef_id = cef_id;
     entry.browser = browser;
-    browsers_.emplace(public_id, std::move(entry));
+    // popup 继承 opener 的 context，显式创建继承传入的 context；由引擎回报，
+    // 不从创建路径猜测。
+    entry.request_context = browser->GetHost()->GetRequestContext();
     public_by_cef_id_.emplace(cef_id, public_id);
   } catch (...) {
     browsers_.erase(public_id);
@@ -949,6 +1018,9 @@ void SessionCore::ForceCloseAll() {
       browser->GetHost()->CloseBrowser(true);
     }
   }
+  // context 尚未初始化完成的挂起创建没有 CefBrowser 可关，按创建失败
+  // 交付并移除条目，否则 browsers_ 无法收敛、消息循环退不出。
+  CancelPendingCreates();
 }
 
 void SessionCore::MaybeQuit() {
@@ -967,27 +1039,48 @@ void SessionCore::MaybeQuit() {
 
 // ---- 会话 API ----
 
-iris_status_t SessionCore::CreateBrowser(const iris_utf8_t& url,
-                                         iris_browser_id_t* browser_out) {
-  if (!ready_delivered_ || shutdown_requested_) {
-    return Status(IRIS_NOT_READY, 0);
+ProfileContextState* SessionCore::ResolveProfileContext(
+    const std::string& key,
+    iris_status_t* out_status) {
+  if (key.empty()) {
+    *out_status = OkStatus();
+    return nullptr;
   }
-  if (!browser_out || !Utf8ViewValid(url) || url.len == 0) {
-    return Status(IRIS_INVALID_ARGUMENT, 0);
-  }
-  const std::string url_text = Utf8FromStringView(url);
-
-  // URL 合法性：复用 CEF 解析器（覆盖 about:blank/data: 等标准形式）。
-  CefURLParts parts{};
-  if (!CefParseURL(url_text, parts)) {
-    return Status(IRIS_INVALID_ARGUMENT, 0);
-  }
-
-  const uint64_t pending_id = AllocateBrowserId();
-  if (!pending_id) {
-    return Status(IRIS_INVALID_ARGUMENT, 0);
+  if (auto it = profile_contexts_.find(key); it != profile_contexts_.end()) {
+    if (it->second.failed) {
+      // context 初始化或偏好下发已失败过：确定性错误，不重复创建。
+      *out_status = Status(IRIS_INITIALIZATION_FAILED);
+      return nullptr;
+    }
+    *out_status = OkStatus();
+    return &it->second;
   }
 
+  CefRequestContextSettings context_settings;
+  // ChromeBrowserContext 只认 DirName()==user_data_dir 的 cache_path，
+  // 即 profile 目录必须是 root_cache_path 的直接子目录；固定前缀同时
+  // 避开 Chromium 内部目录名与 Windows 保留设备名。
+  const std::filesystem::path dir =
+      std::filesystem::path(cache_path_) / ("iris-profile-" + key);
+  CefString(&context_settings.cache_path).FromWString(dir.wstring());
+  // 与全局上下文保持同一语言画像。
+  CefString(&context_settings.accept_language_list)
+      .FromString(std::string(profile::kAcceptLanguage));
+  CefRefPtr<CefRequestContext> context = CefRequestContext::CreateContext(
+      context_settings, new ProfileContextHandler(this, key));
+  if (!context) {
+    *out_status = Status(IRIS_INITIALIZATION_FAILED);
+    return nullptr;
+  }
+  ProfileContextState& state = profile_contexts_[key];
+  state.context = context;
+  *out_status = OkStatus();
+  return &state;
+}
+
+bool SessionCore::CreateBrowserNow(iris_browser_id_t pending_id,
+                                   const std::string& url,
+                                   CefRefPtr<CefRequestContext> context) {
   CefWindowInfo window_info;
   if (windowless_) {
     // OSR：SetAsWindowless 同时固定 Alloy 风格。
@@ -1006,14 +1099,116 @@ iris_status_t SessionCore::CreateBrowser(const iris_utf8_t& url,
     bool& active;
     ~SyncCreationScope() { active = false; }
   } creation_scope{sync_create_in_flight_};
-  CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
-      window_info, client_, url_text, settings, nullptr, nullptr);
-  sync_create_in_flight_ = false;
+  return CefBrowserHost::CreateBrowserSync(window_info, client_, url, settings,
+                                         nullptr, context) != nullptr;
+}
 
-  if (!browser) {
+void SessionCore::OnProfileContextInitialized(const std::string& key) {
+  if (shutting_down_) {
+    return;
+  }
+  auto it = profile_contexts_.find(key);
+  if (it == profile_contexts_.end() || it->second.initialized) {
+    return;
+  }
+  ProfileContextState& state = it->second;
+  state.initialized = true;
+  // 偏好下发是 profile 完整性的一部分：失败即标记该 profile 永久不可
+  // 用，不静默降级继续服务。
+  state.failed = !ApplyWebRtcPolicy(state.context.get());
+
+  if (auto pending_it = pending_profile_creates_.find(key);
+      pending_it != pending_profile_creates_.end()) {
+    std::vector<PendingProfileCreate> pendings =
+        std::move(pending_it->second);
+    pending_profile_creates_.erase(pending_it);
+    for (const PendingProfileCreate& pending : pendings) {
+      const bool ok =
+          !state.failed && !shutdown_requested_ &&
+          CreateBrowserNow(pending.id, pending.url, state.context);
+      if (!ok) {
+        // 与 OnBeforePopupAborted 同一通道：异步创建失败经 LOAD_ERROR
+        // 交付，Pending ID 随之作废。
+        browsers_.erase(pending.id);
+        QueueEvent(IRIS_EVENT_LOAD_ERROR, pending.id, 0,
+                   Status(IRIS_INITIALIZATION_FAILED),
+                   LoadErrorPayload(0, "Browser creation failed", ""));
+      }
+    }
+  }
+  ScheduleDrain();  // shutdown 期间挂起创建解析可能满足退出条件。
+}
+
+void SessionCore::CancelPendingCreates() {
+  for (auto& pair : pending_profile_creates_) {
+    for (const PendingProfileCreate& pending : pair.second) {
+      browsers_.erase(pending.id);
+      QueueEvent(IRIS_EVENT_LOAD_ERROR, pending.id, 0,
+                 Status(IRIS_INITIALIZATION_FAILED),
+                 LoadErrorPayload(0, "Browser creation failed", ""));
+    }
+  }
+  pending_profile_creates_.clear();
+}
+
+iris_status_t SessionCore::CreateBrowser(const iris_utf8_t& url,
+                                         const iris_utf8_t& profile,
+                                         iris_browser_id_t* browser_out) {
+  if (!ready_delivered_ || shutdown_requested_) {
+    return Status(IRIS_NOT_READY, 0);
+  }
+  if (!browser_out || !Utf8ViewValid(url) || url.len == 0 ||
+      !Utf8ViewValid(profile)) {
+    return Status(IRIS_INVALID_ARGUMENT, 0);
+  }
+  const std::string url_text = Utf8FromStringView(url);
+  const std::string profile_key = Utf8FromStringView(profile);
+  if (!profile_key.empty() && !ProfileKeyValid(profile_key)) {
+    return Status(IRIS_INVALID_ARGUMENT, 0);
+  }
+
+  // URL 合法性：复用 CEF 解析器（覆盖 about:blank/data: 等标准形式）。
+  CefURLParts parts{};
+  if (!CefParseURL(url_text, parts)) {
+    return Status(IRIS_INVALID_ARGUMENT, 0);
+  }
+
+  iris_status_t context_status;
+  ProfileContextState* profile_state =
+      ResolveProfileContext(profile_key, &context_status);
+  if (context_status.code != IRIS_OK) {
+    return context_status;
+  }
+  CefRefPtr<CefRequestContext> request_context =
+      profile_state ? profile_state->context : nullptr;
+
+  const uint64_t pending_id = AllocateBrowserId();
+  if (!pending_id) {
+    return Status(IRIS_INVALID_ARGUMENT, 0);
+  }
+
+  // 预登记条目：具名 profile 的 context 异步初始化，Pending ID 先于
+  // CefBrowser 存在期间，提前操作必须按契约返回 NOT_READY 而非
+  // BROWSER_CLOSED；条目同时持有 context 引用保证其存活。
+  BrowserEntry pending;
+  pending.public_id = pending_id;
+  pending.request_context = request_context;
+  browsers_.emplace(pending_id, std::move(pending));
+
+  if (profile_state && !profile_state->initialized) {
+    try {
+      pending_profile_creates_[profile_key].push_back(
+          PendingProfileCreate{pending_id, url_text});
+    } catch (...) {
+      browsers_.erase(pending_id);
+      throw;
+    }
+  } else if (!CreateBrowserNow(pending_id, url_text, request_context)) {
+    browsers_.erase(pending_id);
     *browser_out = 0;
     return Status(IRIS_INITIALIZATION_FAILED);
   }
+
   *browser_out = pending_id;
   return OkStatus();
 }
@@ -1150,6 +1345,11 @@ void SessionCore::Configure(const iris_config_t& config,
   windowless_ = config.window_mode == IRIS_WINDOW_MODE_WINDOWLESS;
   remote_debugging_port_ = config.remote_debugging_port;
   cache_path_ = WideFromUtf16View(config.cache_path_utf16);
+  // 归一化为 user_data_dir 的同款形式，保证具名 profile 的
+  // DirName()==user_data_dir 逐字符成立(见 FullPathNameW 注释)。
+  if (std::wstring resolved = FullPathNameW(cache_path_); !resolved.empty()) {
+    cache_path_ = std::move(resolved);
+  }
   timezone_ = Utf8FromStringView(config.timezone_utf8);
   callback_ = callback;
   user_data_ = user_data;
@@ -1248,6 +1448,9 @@ iris_status_t SessionCore::Run() {
   }
   browsers_.clear();
   public_by_cef_id_.clear();
+  pending_profile_creates_.clear();
+  // browser 持有的 context 引用已随条目释放；此处释放池内全部隔离上下文。
+  profile_contexts_.clear();
   client_ = nullptr;
   app_ = nullptr;
   CefShutdown();
@@ -1329,6 +1532,7 @@ iris_status_t iris_run(const iris_config_t* config,
 
 iris_status_t iris_create_browser(iris_session_t* session,
                                   iris_utf8_t url,
+                                  iris_utf8_t profile,
                                   iris_browser_id_t* browser_out) {
   using namespace iris;  // NOLINT(build/namespaces)
   try {
@@ -1336,7 +1540,7 @@ iris_status_t iris_create_browser(iris_session_t* session,
     if (gate.code != IRIS_OK) {
       return gate;
     }
-    return GetBootstrap().active_core->CreateBrowser(url, browser_out);
+    return GetBootstrap().active_core->CreateBrowser(url, profile, browser_out);
   } catch (...) {
     return Status(IRIS_INITIALIZATION_FAILED, 0);
   }

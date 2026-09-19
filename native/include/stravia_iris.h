@@ -191,14 +191,24 @@ IRIS_EXPORT iris_status_t iris_run(const iris_config_t* config,
 
 ///
 /// 创建 browser（Alloy 风格，1280x720 初始 viewport；windowless 为 OSR）。
+/// profile 为空视图时使用全局默认上下文；非空时必须是 1..64 个
+/// ASCII 字母/数字/`-`/`_` 字符，映射为
+/// <cache_path>/iris-profile-<profile> 下独立的 request context：cookie、
+/// 站点存储与 HTTP 缓存按 profile 隔离，同 profile 的 browser（含其
+/// popup）共享同一上下文。指纹 seed 与时区为会话级，不随 profile 变化；
+/// 同一具名目录不能被多个运行实例同时占用。
 /// ID 在对应的 IRIS_EVENT_BROWSER_CREATED 交付前处于 Pending，提前操作返回
-/// IRIS_NOT_READY。同步创建失败（CreateBrowserSync 返回空）立即返回
-/// IRIS_INITIALIZATION_FAILED，不发布有效 ID、不等待创建回调。
-/// 网站 popup 的异步创建失败通过 IRIS_EVENT_LOAD_ERROR 通知。
+/// IRIS_NOT_READY。同步校验或创建失败（参数非法、隔离上下文创建失败、
+/// CreateBrowserSync 返回空）立即返回 IRIS_INVALID_ARGUMENT 或
+/// IRIS_INITIALIZATION_FAILED，不发布有效 ID。具名 profile 的上下文
+/// 异步初始化，初始化或偏好下发失败、或随后的创建失败经
+/// IRIS_EVENT_LOAD_ERROR（IRIS_INITIALIZATION_FAILED）通知，该 Pending
+/// ID 随之作废；网站 popup 的异步创建失败同样经此通知。
 /// 必须在事件回调内调用。
 ///
 IRIS_EXPORT iris_status_t iris_create_browser(iris_session_t* session,
                                   iris_utf8_t url,
+                                  iris_utf8_t profile,
                                   iris_browser_id_t* browser_out);
 
 ///

@@ -105,7 +105,9 @@
 //! ## 外部 CDP
 //!
 //! 显式设置端口后，客户端连接并控制由 SDK 创建的既有页面。
-//! 新 browser 使用 [`Session::create_browser`]，由同一生命周期跟踪。
+//! 新 browser 使用 [`Session::create_browser`]（全局默认上下文）或
+//! [`Session::create_browser_in_profile`]（具名隔离 profile），
+//! 由同一生命周期跟踪。
 //! 不承诺 Playwright/Puppeteer 的 launch、newContext 或 newPage：
 //! Chrome `Target.createTarget` 可能生成没有 CefBrowser 的 WebContents，
 //! 不属于本 SDK 已验证的窗口所有权路径。

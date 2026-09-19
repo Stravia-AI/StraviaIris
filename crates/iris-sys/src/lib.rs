@@ -153,9 +153,15 @@ unsafe extern "C" {
 
     /// 显式创建 browser(`CefBrowserHost::CreateBrowserSync`):
     /// 返回的 ID 在 BrowserCreated 事件交付前处于 Pending。
+    /// profile 空视图 = 全局默认上下文;非空为具名隔离 profile,
+    /// 1..=64 个 ASCII 字母/数字/`-`/`_`,映射为
+    /// <cache>/iris-profile-<profile>。具名 profile 的 context 异步
+    /// 初始化,初始化或随后创建失败经 LOAD_ERROR(INITIALIZATION_FAILED)
+    /// 通知,Pending ID 随之作废。
     pub fn iris_create_browser(
         session: *mut IrisSession,
         url: IrisUtf8View,
+        profile: IrisUtf8View,
         browser: *mut IrisBrowserId,
     ) -> IrisStatus;
 

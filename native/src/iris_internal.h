@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
@@ -144,12 +145,29 @@ struct BrowserEntry {
   bool created_delivered = false;
   CefRefPtr<CefBrowser> browser;
   CefRefPtr<CefRegistration> devtools_registration;
+  // browser 所属的 request context（全局上下文时同样非空，由 CEF 回报）。
+  CefRefPtr<CefRequestContext> request_context;
 };
 
 struct PendingCommand {
   uint64_t public_request = 0;
   iris_browser_id_t browser = 0;
   int native_message_id = 0;
+};
+
+// context 初始化完成前到达的显式创建请求。
+struct PendingProfileCreate {
+  iris_browser_id_t id = 0;
+  std::string url;
+};
+
+// 具名 profile 的隔离上下文状态：context 在 UI 线程异步初始化，
+// initialized 置位后才允许 CreateBrowserSync；初始化或偏好下发失败
+// 标记 failed，该 profile 永久不可用（不静默降级继续服务）。
+struct ProfileContextState {
+  CefRefPtr<CefRequestContext> context;
+  bool initialized = false;
+  bool failed = false;
 };
 
 // UI 线程任务：事件 drain（串行、禁止重入）。
@@ -174,6 +192,7 @@ class SessionCore {
 
   // ---- 会话 API（均要求 UI 线程 + 会话有效）----
   iris_status_t CreateBrowser(const iris_utf8_t& url,
+                              const iris_utf8_t& profile,
                               iris_browser_id_t* browser_out);
   iris_status_t Command(iris_browser_id_t browser,
                         const iris_utf8_t& method,
@@ -205,6 +224,7 @@ class SessionCore {
   // CefApp/CefClient 回调（均在 UI 线程）。
   friend class IrisAppImpl;
   friend class IrisClientImpl;
+  friend class ProfileContextHandler;
   void OnBeforeCommandLineProcessing(const CefString& process_type,
                                      CefRefPtr<CefCommandLine> command_line);
   void OnContextInitialized();
@@ -231,6 +251,25 @@ class SessionCore {
                        const void* params,
                        size_t params_size);
   void OnDevToolsAgentDetached(CefRefPtr<CefBrowser> browser);
+
+  // 具名 profile → 隔离 request context（<cache>/iris-profile-<key>）。
+  // 空 key 返回 nullptr 且状态为 Ok，表示全局默认上下文；新 key 惰性
+  // 创建并注册 ProfileContextHandler（异步初始化）。failed 条目返回
+  // InitializationFailed。失败仅返回错误状态，不中止运行。
+  ProfileContextState* ResolveProfileContext(const std::string& key,
+                                             iris_status_t* out_status);
+  // 对已初始化 context 执行 CreateBrowserSync，经 sync_create_* 与
+  // OnAfterCreated 配对 pending ID。失败返回 false，由调用方清理
+  // pending 条目。
+  bool CreateBrowserNow(iris_browser_id_t pending_id,
+                        const std::string& url,
+                        CefRefPtr<CefRequestContext> context);
+  // ProfileContextHandler 回调（UI 线程）：context 初始化完成，
+  // 下发 WebRTC 偏好并消费该 profile 的全部挂起创建。
+  void OnProfileContextInitialized(const std::string& key);
+  // shutdown/失败路径：全部挂起创建按创建失败交付 LoadError 并移除
+  // pending 条目，保证 browsers_ 收敛后消息循环可以退出。
+  void CancelPendingCreates();
 
   // 事件与 drain。
   void QueueEvent(uint32_t kind,
@@ -306,6 +345,11 @@ class SessionCore {
 
   std::map<iris_browser_id_t, BrowserEntry> browsers_;
   std::map<int, iris_browser_id_t> public_by_cef_id_;
+  // 具名 profile 的隔离上下文池；条目在 CefShutdown 前于 UI 线程统一释放。
+  std::map<std::string, ProfileContextState> profile_contexts_;
+  // context 初始化完成前到达的创建请求（key → 挂起队列）。
+  std::map<std::string, std::vector<PendingProfileCreate>>
+      pending_profile_creates_;
   std::map<int, PendingCommand> pending_by_native_id_;
   std::map<iris_request_id_t, int> native_by_public_request_;
   std::deque<QueuedEvent> queue_;

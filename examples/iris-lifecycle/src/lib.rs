@@ -25,7 +25,9 @@ fn app() -> Result<(), Error> {
         .ok_or_else(|| Error::application("missing IRIS_SDK_TEST_CACHE"))?;
     let output = std::env::var_os("IRIS_SDK_TEST_REPORT")
         .ok_or_else(|| Error::application("missing IRIS_SDK_TEST_REPORT"))?;
-    if !["close-pending", "panic", "timeout", "crash"].contains(&case.as_str()) {
+    if !["close-pending", "panic", "timeout", "crash", "profiles"]
+        .contains(&case.as_str())
+    {
         return Err(Error::application("unknown lifecycle case"));
     }
     let config = Config::new(cache.into(), 42).window_mode(WindowMode::Windowless);
@@ -44,6 +46,14 @@ fn app() -> Result<(), Error> {
     let mut recovered = false;
     let mut recovery_frame_seen = false;
     let mut recovery_read_sent = false;
+    // profiles 用例：alpha/beta 为两个隔离 profile,gamma 复用 alpha,
+    // delta 验证 Windows 保留名(经 iris-profile- 前缀映射后合法)。
+    let mut alpha = None;
+    let mut beta = None;
+    let mut gamma = None;
+    let mut delta = None;
+    let mut isolation_seen = false;
+    let mut sharing_seen = false;
     let started = Instant::now();
     let result = iris::run(config, |session, event| {
         records.push(
@@ -56,21 +66,73 @@ fn app() -> Result<(), Error> {
             match event {
                 Event::Ready => {
                     println!("iris-lifecycle: Ready ({case})");
-                    let browser = session.create_browser("about:blank")?;
-                    first = Some(browser);
-                    assert_eq!(
-                        session
-                            .command(browser, "Runtime.enable", json!({}))
-                            .unwrap_err()
-                            .kind(),
-                        ErrorKind::NotReady
-                    );
-                    assert_eq!(
-                        session.create_browser("").unwrap_err().kind(),
-                        ErrorKind::InvalidArgument
-                    );
-                    if case == "close-pending" {
-                        keeper = Some(session.create_browser("about:blank")?);
+                    if case == "profiles" {
+                        for bad in ["..", "a/b", "a\\b", "has space", "."] {
+                            assert_eq!(
+                                session
+                                    .create_browser_in_profile("about:blank", bad)
+                                    .unwrap_err()
+                                    .kind(),
+                                ErrorKind::InvalidArgument
+                            );
+                        }
+                        assert_eq!(
+                            session
+                                .create_browser_in_profile("about:blank", &"p".repeat(65))
+                                .unwrap_err()
+                                .kind(),
+                            ErrorKind::InvalidArgument
+                        );
+                        alpha = Some(session.create_browser_in_profile(
+                            "about:blank",
+                            "alpha",
+                        )?);
+                        beta = Some(session.create_browser_in_profile(
+                            "about:blank",
+                            "beta",
+                        )?);
+                        delta = Some(session.create_browser_in_profile(
+                            "about:blank",
+                            "com9",
+                        )?);
+                    } else {
+                        let browser = session.create_browser("about:blank")?;
+                        first = Some(browser);
+                        assert_eq!(
+                            session
+                                .command(browser, "Runtime.enable", json!({}))
+                                .unwrap_err()
+                                .kind(),
+                            ErrorKind::NotReady
+                        );
+                        assert_eq!(
+                            session.create_browser("").unwrap_err().kind(),
+                            ErrorKind::InvalidArgument
+                        );
+                        if case == "close-pending" {
+                            keeper = Some(session.create_browser("about:blank")?);
+                        }
+                    }
+                }
+                Event::BrowserCreated { browser } if case == "profiles" => {
+                    const PROBE_URL: &str = "https://probe.invalid/";
+                    if Some(browser) == alpha {
+                        let id = session.command(browser, "Network.setCookie", json!({
+                            "url": PROBE_URL, "name": "probe", "value": "alpha"
+                        }))?;
+                        pending.insert(id, ("set-alpha", started.elapsed()));
+                    } else if Some(browser) == beta {
+                        let id = session.command(browser, "Network.getCookies", json!({
+                            "urls": [PROBE_URL]
+                        }))?;
+                        pending.insert(id, ("get-beta-empty", started.elapsed()));
+                    } else if Some(browser) == gamma {
+                        let id = session.command(browser, "Network.getCookies", json!({
+                            "urls": [PROBE_URL]
+                        }))?;
+                        pending.insert(id, ("get-gamma-shared", started.elapsed()));
+                    } else if Some(browser) == delta {
+                        session.close_browser(browser)?;
                     }
                 }
                 Event::BrowserCreated { browser } if Some(browser) == first => {
@@ -170,6 +232,57 @@ fn app() -> Result<(), Error> {
                             recovered = true;
                             session.close_browser(browser)?;
                         }
+                        "set-alpha" => {
+                            result?;
+                            // 写入提交后再建同 profile 的第二个 browser，
+                            // 保证共享存储的读取顺序确定。
+                            gamma = Some(session.create_browser_in_profile(
+                                "about:blank",
+                                "alpha",
+                            )?);
+                            session.close_browser(browser)?;
+                        }
+                        "get-beta-empty" => {
+                            let value = result?;
+                            assert!(
+                                value["cookies"].as_array().is_some_and(Vec::is_empty),
+                                "beta profile must not see alpha cookies: {value}"
+                            );
+                            isolation_seen = true;
+                            let id = session.command(browser, "Network.setCookie", json!({
+                                "url": "https://probe.invalid/",
+                                "name": "probe", "value": "beta"
+                            }))?;
+                            pending.insert(id, ("set-beta", started.elapsed()));
+                        }
+                        "set-beta" => {
+                            result?;
+                            let id = session.command(browser, "Network.getCookies", json!({
+                                "urls": ["https://probe.invalid/"]
+                            }))?;
+                            pending.insert(id, ("get-beta-own", started.elapsed()));
+                        }
+                        "get-beta-own" => {
+                            let value = result?;
+                            assert!(
+                                value["cookies"].as_array().is_some_and(|cookies| {
+                                    cookies.iter().any(|c| c["value"] == "beta")
+                                }),
+                                "beta profile must see its own cookie: {value}"
+                            );
+                            session.close_browser(browser)?;
+                        }
+                        "get-gamma-shared" => {
+                            let value = result?;
+                            assert!(
+                                value["cookies"].as_array().is_some_and(|cookies| {
+                                    cookies.iter().any(|c| c["value"] == "alpha")
+                                }),
+                                "second alpha browser must share the profile store: {value}"
+                            );
+                            sharing_seen = true;
+                            session.close_browser(browser)?;
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -221,9 +334,15 @@ fn app() -> Result<(), Error> {
                     }
                 }
                 Event::LoadError { code, message, .. } => {
-                    return Err(Error::application(format!(
-                        "unexpected load error {code}: {message}"
-                    )));
+                    // profiles 用例的 browser 只加载 about:blank：deferred
+                    // 创建使初始导航在关闭时仍可能在途，ERR_ABORTED(-3) 是
+                    // 预期拆卸噪声；异步创建失败经 code=0 + 不同 message
+                    // 上报，不被本分支掩盖。
+                    if !(case == "profiles" && code == -3) {
+                        return Err(Error::application(format!(
+                            "unexpected load error {code}: {message}"
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -236,15 +355,30 @@ fn app() -> Result<(), Error> {
         ControlFlow::Continue(())
     });
     let observed_error = result.as_ref().err().map(|e| format!("{:?}", e.kind()));
-    let repeated = iris::run(
-        Config::new(std::env::temp_dir().join("iris-repeat-unused"), 42),
-        |_, _| ControlFlow::Break(()),
-    );
-    let repeated_kind = repeated.unwrap_err().kind();
+    // run_started 只在配置校验通过后置位:首轮 InvalidArgument 未占用
+    // 一次性运行标记,此时重复运行合法,跳过 AlreadyRun 探针,真正错误
+    // 由下方 result? 报告。
+    let repeated_kind = if matches!(
+        result.as_ref().err().map(Error::kind),
+        Some(ErrorKind::InvalidArgument)
+    ) {
+        None
+    } else {
+        Some(
+            iris::run(
+                Config::new(std::env::temp_dir().join("iris-repeat-unused"), 42),
+                |_, _| ControlFlow::Break(()),
+            )
+            .unwrap_err()
+            .kind(),
+        )
+    };
     let report = json!({
         "case": case, "runError": observed_error, "panicTriggered": panic_triggered,
         "crashSeen": crash_seen, "cancellationSeen": cancellation_seen, "timeoutSeen": timeout_seen,
-        "rendererRecovered": recovered, "identity": identity, "repeatError": format!("{repeated_kind:?}"),
+        "rendererRecovered": recovered, "identity": identity,
+        "repeatError": repeated_kind.map(|k| format!("{k:?}")),
+        "isolationSeen": isolation_seen, "sharingSeen": sharing_seen,
         "pendingRemaining": pending.len(), "closedBrowsers": closed.len(),
         "completedRequests": completed.len(), "records": records
     });
@@ -262,15 +396,23 @@ fn app() -> Result<(), Error> {
             return Err(error);
         }
         assert!(pending.is_empty(), "pending commands leaked after shutdown");
-        assert_eq!(closed.len(), if case == "close-pending" { 2 } else { 1 });
+        let expected_closed = match case.as_str() {
+            "close-pending" => 2,
+            "profiles" => 4,
+            _ => 1,
+        };
+        assert_eq!(closed.len(), expected_closed);
         match case.as_str() {
             "close-pending" => assert!(cancellation_seen),
             "timeout" => assert!(timeout_seen),
             "crash" => assert!(crash_seen && cancellation_seen && recovered),
+            "profiles" => assert!(isolation_seen && sharing_seen),
             _ => unreachable!(),
         }
     }
-    assert_eq!(repeated_kind, ErrorKind::AlreadyRun);
+    if let Some(kind) = repeated_kind {
+        assert_eq!(kind, ErrorKind::AlreadyRun);
+    }
     println!("iris-lifecycle: {case} passed; repeated run rejected");
     Ok(())
 }

@@ -48,17 +48,43 @@ impl<'a> Session<'a> {
     /// 处于 Pending:提前操作返回 `NotReady`)。返回 Pending ID；
     /// 同步创建失败立即返回 InitializationFailed，不发布有效 ID。
     ///
-    /// 网站 popup 由 native 按上游正常创建并继承同一 profile,
-    /// 不经本方法。
+    /// 使用全局默认上下文;要按用户隔离 cookie/站点存储/缓存,改用
+    /// [`Self::create_browser_in_profile`]。网站 popup 由 native 按上游
+    /// 正常创建并继承同一 profile,不经本方法。
     pub fn create_browser(&mut self, url: &str) -> Result<BrowserId, Error> {
+        self.create_browser_in_profile(url, "")
+    }
+
+    /// 在具名隔离 profile 中创建 browser:cookie、站点存储与 HTTP 缓存
+    /// 按 profile 隔离于 `<cache>/iris-profile-<profile>`;同 profile 的
+    /// browser(含其 popup)共享同一 request context,空 `profile` 与
+    /// [`Self::create_browser`] 等价(全局默认上下文)。指纹 seed 与时区
+    /// 为会话级,不随 profile 变化。
+    ///
+    /// `profile` 必须为 1..=64 个 ASCII 字母/数字/`-`/`_`;native 同步
+    /// 校验,违者 `InvalidArgument`。同一具名目录不能被多个运行实例
+    /// 同时占用。
+    ///
+    /// 具名 profile 的 request context 异步初始化;初始化或随后的
+    /// 创建失败经 `Event::LoadError`(`InitializationFailed`)交付,
+    /// 该 Pending ID 随之作废,不再收到 `BrowserCreated`/`BrowserClosed`。
+    pub fn create_browser_in_profile(
+        &mut self,
+        url: &str,
+        profile: &str,
+    ) -> Result<BrowserId, Error> {
         let session = self.alive()?;
         let url_view = views::utf8(url.as_bytes());
+        let profile_view = views::utf8(profile.as_bytes());
         let mut browser_id: u64 = 0;
         // Safety:session 指针来自 native 回调,在本次回调(即本借用)
-        // 期间有效;url 视图借用本地切片,存活至函数返回(满足 C 契约
-        // 的“输入借用至函数返回”);出参指向本栈变量且按值返回。
-        let status = unsafe { iris_sys::iris_create_browser(session, url_view, &mut browser_id) };
-        check_status(status, "create_browser failed").map(|()| BrowserId::new(browser_id))
+        // 期间有效;url/profile 视图借用本地切片,存活至函数返回(满足
+        // C 契约的“输入借用至函数返回”);出参指向本栈变量且按值返回。
+        let status = unsafe {
+            iris_sys::iris_create_browser(session, url_view, profile_view, &mut browser_id)
+        };
+        check_status(status, "create_browser_in_profile failed")
+            .map(|()| BrowserId::new(browser_id))
     }
 
     /// 导航到 `url`:即 `Page.navigate` 命令的便捷封装。

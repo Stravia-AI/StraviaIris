@@ -11,7 +11,9 @@
 //
 // 参数：--url=<URL> --seed=<decimal> --headless|--windowed
 //       [--cache-dir=<绝对路径>] [--timezone=<IANA>] [--cdp-port=<1..65535>]
-// 缺省：windowed、host 时区、CDP 关闭、cache 目录默认 %TEMP%\iris-c-sample。
+//       [--profile=<隔离 profile 名>]
+// 缺省：windowed、host 时区、CDP 关闭、全局默认 profile、
+// cache 目录默认 %TEMP%\iris-c-sample。
 
 #include <stravia_iris.h>
 
@@ -32,6 +34,7 @@ typedef struct SampleOptions {
   const char* cache_dir;
   const char* timezone;
   unsigned long cdp_port;
+  const char* profile;
 } SampleOptions;
 
 static SampleOptions g_options;
@@ -52,6 +55,7 @@ static int ParseOptions(int argc, char** argv, char* error, size_t error_size) {
   g_options.cache_dir = NULL;
   g_options.timezone = NULL;
   g_options.cdp_port = 0;
+  g_options.profile = NULL;
 
   for (int i = 1; i < argc; ++i) {
     const char* arg = argv[i];
@@ -86,6 +90,8 @@ static int ParseOptions(int argc, char** argv, char* error, size_t error_size) {
         _snprintf(error, error_size, "illegal cdp-port: %s", value);
         return 0;
       }
+    } else if (strncmp(arg, "--profile=", 10) == 0) {
+      g_options.profile = arg + 10;
     } else {
       _snprintf(error, error_size, "unknown argument: %s", arg);
       return 0;
@@ -210,10 +216,15 @@ static uint32_t OnEvent(iris_session_t* session,
 
   switch (event->kind) {
     case IRIS_EVENT_READY: {
+      iris_utf8_t profile_view = {NULL, 0};
+      if (g_options.profile && g_options.profile[0] != '\0') {
+        profile_view.data = (const uint8_t*)g_options.profile;
+        profile_view.len = strlen(g_options.profile);
+      }
       status = iris_create_browser(session,
                                    (iris_utf8_t){(const uint8_t*)g_options.url,
                                                  strlen(g_options.url)},
-                                   &g_browser);
+                                   profile_view, &g_browser);
       if (status.code != IRIS_OK) {
         g_failed = 1;
         printf("[sample] create browser failed: %d/%d\n", status.code,
