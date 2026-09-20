@@ -55,6 +55,10 @@ class CI:
         require(self.lock["schema_version"] == 1, "不支持的锁文件版本")
         self.build_args = dict(self.lock["build"])
         self.build_args["target_cpu"] = self.pcfg["cpu"]
+        if self.platform.startswith("linux"):
+            # gn_args 仅在 use_sysroot 时才为已装 sysroot 的架构生成配置；
+            # arm64 在 ValidateArgs 里还硬性要求它。
+            self.build_args["use_sysroot"] = True
         self.src = self.root / "chromium/src"
         self.cef = self.src / "cef"
         self.out = self.src / "out" / self.config
@@ -255,11 +259,11 @@ class CI:
         try:
             self.run([sys.executable, automate, *args])
         except subprocess.CalledProcessError:
-            # 首次同步时 DEPS 还不存在，gperf cipd dep 会先炸一次。
-            # automate 的 nohistory 续跑路径见 src/ 存在即整体早退，既不
-            # 续 sync 也不跑 runhooks，只能手动补完 sync 后再交给 automate
-            # 做 cef 复制等收尾，最后补跑 runhooks（工具链钩子）。
-            if self.platform != "linux-arm64" or not (self.src / "DEPS").is_file():
+            # automate 的 nohistory 续跑路径见 src/ 存在即整体早退：sync
+            # 中断后直接重跑 automate 不会续同步也不跑 runhooks。DEPS 已
+            # 检出就手动补完 sync（gperf cipd 缺 arm64 包只是中断形态之
+            # 一），再交 automate 做 cef 复制等收尾，最后补跑 runhooks。
+            if not (self.src / "DEPS").is_file():
                 raise
             self.patch_deps_gperf()
             self.run(["gclient.bat" if IS_WINDOWS else "gclient",

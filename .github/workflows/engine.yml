@@ -73,7 +73,10 @@ jobs:
               windows-x64)   echo "${RUNNER_WINDOWS_X64:-windows-2022}" ;;
               windows-arm64) echo "${RUNNER_WINDOWS_ARM64:-windows-2022}" ;;
               linux-x64)     echo "${RUNNER_LINUX_X64:-ubuntu-22.04}" ;;
-              linux-arm64)   echo "${RUNNER_LINUX_ARM64:-ubuntu-24.04-arm}" ;;
+              # linux-arm64 在 x64 宿主上交叉编译：上游只发布 x64 的
+              # llvm-build 工具链（无 Linux_arm64 包），arm64 runner 上
+              # clang 根本跑不起来；x64 clang 本身就是交叉编译器。
+              linux-arm64)   echo "${RUNNER_LINUX_ARM64:-ubuntu-22.04}" ;;
             esac
           }
           root_for() {
