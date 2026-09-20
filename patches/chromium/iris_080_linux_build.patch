@@ -1,0 +1,25 @@
+目的：锁定 enable_supervised_users=false 时修复 Linux GN 生成失败。
+来源：原创 StraviaIris；基线 https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
+许可：保留 Chromium BSD 许可。
+验收：linux gn gen 不再因 chrome_app_unittests 断言 enable_supervised_users 失败；
+该目标仅为测试目标，不在 libcef/cefsimple 构建闭包内。
+
+diff --git BUILD.gn BUILD.gn
+--- BUILD.gn
++++ BUILD.gn
+@@ -25,6 +25,7 @@
+ import("//chrome/browser/buildflags.gni")
+ import("//chrome/enterprise_companion/buildflags.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
++import("//components/supervised_user/buildflags.gni")
+ import("//device/vr/buildflags/buildflags.gni")
+ import("//extensions/buildflags/buildflags.gni")
+@@ -601,7 +601,7 @@
+       ]
+ 
+-      if (!is_castos) {
++      if (!is_castos && enable_supervised_users) {
+         deps += [ "//chrome/test:chrome_app_unittests" ]
+       }
+ 
+       if (!is_debug && !is_component_build && !is_castos) {

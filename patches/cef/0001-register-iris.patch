@@ -6,7 +6,7 @@
 diff --git patch/patch.cfg patch/patch.cfg
 --- patch/patch.cfg
 +++ patch/patch.cfg
-@@ -900,5 +900,14 @@
+@@ -900,5 +900,15 @@
    {
      # Guard background extensions dependency on enable_background_mode.
      'name': 'chrome_browser_extensions_background',
@@ -21,4 +21,5 @@ diff --git patch/patch.cfg patch/patch.cfg
 +  { 'name': 'iris_050_fonts' },
 +  { 'name': 'iris_060_screen_timezone_webrtc' },
 +  { 'name': 'iris_070_engine_identity' },
++  { 'name': 'iris_080_linux_build' },
  ]

@@ -21,7 +21,7 @@ LOCK = PROJECT / "engine.lock.json"
 NAMES = (
     "iris_000_profile", "iris_010_identity", "iris_020_canvas", "iris_030_gpu",
     "iris_040_audio", "iris_050_fonts", "iris_060_screen_timezone_webrtc",
-    "iris_070_engine_identity",
+    "iris_070_engine_identity", "iris_080_linux_build",
 )
 CONFIG = "Release_GN_x64"
 

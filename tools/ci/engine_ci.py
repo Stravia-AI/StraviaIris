@@ -245,25 +245,56 @@ class CI:
             build_id + "\n", encoding="ascii")
         return build_id
 
+    def _cfg_append(self, cfg, name):
+        """向 patch.cfg 的 patches 列表末尾追加条目（续跑时旧 cfg 缺新补丁）。"""
+        text = cfg.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "patches" for t in node.targets):
+                lines = text.splitlines(keepends=True)
+                idx = node.end_lineno - 1  # ']' 所在行（1 基）
+                prev = idx - 1
+                while prev >= 0 and not lines[prev].strip():
+                    prev -= 1
+                if prev >= 0 and not lines[prev].rstrip("\n").rstrip().endswith(","):
+                    lines[prev] = lines[prev].rstrip("\n") + ",\n"
+                lines.insert(idx, f"  {{ 'name': '{name}' }},\n")
+                cfg.write_text("".join(lines), encoding="utf-8")
+                return
+        raise EngineError("patch.cfg 缺少 patches 赋值")
+
     def apply(self):
-        if self.state.get("applied"):
-            print("补丁已应用；跳过 apply。")
-            return
         paths, hashes = self.queue()
+        if self.state.get("applied") and self.state.get("patches") == hashes:
+            print("补丁已应用且集合未变；跳过 apply。")
+            return
         destination = self.cef / "patch/patches"
         for source in paths:
             target = destination / source.name
-            if not target.exists():
+            if not target.exists() or digest(target) != digest(source):
                 shutil.copyfile(source, target)
-        registration = self.run([sys.executable, self.cef / "tools/patcher.py",
-                                 "--patch-file", paths[0].stem, "--patch-dir", self.cef],
-                                cwd=self.cef, capture=True)
-        print(registration)
-        require("... successfully applied" in registration or "already applied" in registration.lower(),
-                "注册补丁未实际应用")
-        patches = literal_assignment(self.cef / "patch/patch.cfg", "patches")
-        names = [patch["name"] for patch in patches]
-        require(names[-len(NAMES):] == list(NAMES), "自有补丁必须位于 CEF 队列末尾")
+        cfg = self.cef / "patch/patch.cfg"
+        existing = [entry["name"] for entry in literal_assignment(cfg, "patches")]
+        if existing[-len(NAMES):] != list(NAMES):
+            if not any(name in existing for name in NAMES):
+                # 全新队列：注册补丁一次性写入全部条目。
+                registration = self.run(
+                    [sys.executable, self.cef / "tools/patcher.py",
+                     "--patch-file", paths[0].stem, "--patch-dir", self.cef],
+                    cwd=self.cef, capture=True)
+                print(registration)
+                require("... successfully applied" in registration
+                        or "already applied" in registration.lower(),
+                        "注册补丁未实际应用")
+                existing = [entry["name"] for entry in literal_assignment(cfg, "patches")]
+            # 续跑漂移：旧 patch.cfg 缺新增补丁条目 → 程序化补齐到队尾。
+            for name in NAMES:
+                if name not in existing:
+                    self._cfg_append(cfg, name)
+            existing = [entry["name"] for entry in literal_assignment(cfg, "patches")]
+        require(existing[-len(NAMES):] == list(NAMES), "自有补丁必须位于 CEF 队列末尾")
+        patches = literal_assignment(cfg, "patches")
         for entry in patches:
             if entry.get("condition") and entry["condition"] not in self.env:
                 continue
