@@ -104,6 +104,15 @@ class CI:
     def identity(self):
         return {key: self.lock[key]["commit"] for key in ("cef", "chromium", "depot_tools")}
 
+    def head_matches(self, path, want):
+        """.git 完好且 HEAD 匹配才返回 True；损坏检出返回 False 而不是抛异常。"""
+        if not (path / ".git").exists():
+            return False
+        try:
+            return self.git(path, "rev-parse", "HEAD") == want
+        except subprocess.CalledProcessError:
+            return False
+
     def revisions(self):
         for key, path in (("cef", self.cef), ("chromium", self.src),
                           ("depot_tools", self.root / "depot_tools")):
@@ -164,9 +173,23 @@ class CI:
             self.run(["bash", self.root / "depot_tools/ensure_bootstrap"],
                      cwd=self.root / "depot_tools")
         if self.state.get("fetched"):
-            self.revisions()
-            print("源码已同步且修订匹配；跳过 fetch。")
-            return
+            intact = True
+            if not self.state.get("generated"):
+                # gen 前的工作区必须带完好 .git 供修订校验；被打断的接力
+                # 归档会留下残缺检出（.git 存在但 rev-parse 失败），
+                # 在半空源码树上编译只会浪费分段，直接清空重拉。
+                intact = all(self.head_matches(path, self.lock[key]["commit"])
+                             for key, path in (("chromium", self.src), ("cef", self.cef)))
+            if intact:
+                self.revisions()
+                print("源码已同步且修订匹配；跳过 fetch。")
+                return
+            print("接力工作区源码残缺；清空 chromium 目录重新同步。", flush=True)
+            shutil.rmtree(self.src, ignore_errors=True)
+            for flag in ("fetched", "applied", "deps_installed", "generated",
+                         "built", "packaged", "ninja_targets"):
+                self.state.pop(flag, None)
+            save(self.state_path, self.state)
         url = f"https://raw.githubusercontent.com/chromiumembedded/cef/{self.lock['cef']['commit']}/tools/automate/automate-git.py"
         automate = self.root / "automate-git.py"
         if not automate.is_file() or digest(automate) != self.lock["automate"]["sha256"]:
