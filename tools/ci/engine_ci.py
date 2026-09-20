@@ -319,10 +319,26 @@ class CI:
     # ------------------------------------------------------------------
     # 阶段：gen —— GN 生成（复用 CEF 上游生成器）
     # ------------------------------------------------------------------
+    def ensure_sysroot(self):
+        if IS_WINDOWS:
+            return
+        arch = {"x64": "amd64", "arm": "armhf", "arm64": "arm64"}[self.pcfg["cpu"]]
+        base = self.src / "build/linux"
+        if any(base.glob(f"debian_*_{arch}-sysroot")):
+            return
+        # use_sysroot=true（CEF linux 默认）时 gn_args 只承认已安装 sysroot
+        # 的架构；宿主编译一般已装宿主 arch，缺了就在这里补齐。
+        script = base / "sysroot_scripts/install-sysroot.py"
+        require(script.is_file(), "缺少 install-sysroot.py")
+        self.run([sys.executable, script, f"--arch={arch}"])
+        require(any(base.glob(f"debian_*_{arch}-sysroot")),
+                f"sysroot 未安装：{arch}")
+
     def gen(self):
         if self.state.get("generated"):
             print("GN 项目已生成；跳过 gen。")
             return
+        self.ensure_sysroot()
         self.run([sys.executable, PROJECT / "tools/engine_projects.py",
                   "--cef", self.cef, "--configuration", self.config], cwd=self.cef)
         require((self.out / "args.gn").is_file(), "GN 未产出 args.gn")
