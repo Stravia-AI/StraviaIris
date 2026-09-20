@@ -56,7 +56,7 @@
     "patches/chromium/iris_050_fonts.patch": "cf980ac142358a0e917b287ca525bff8fc9763fab5bcd7695fb7c5a5425e9015",
     "patches/chromium/iris_060_screen_timezone_webrtc.patch": "85de120f966bd75f766ca72b4d1c008a06cfd7836b71d107035996e09cb41c14",
     "patches/chromium/iris_070_engine_identity.patch": "abc19b8f9351f454c835692c82af2d15fbb1a5d7aecd88b0ee80411083b8e641",
-    "patches/chromium/iris_080_linux_build.patch": "4b700f8da308e22e8b2be7c973ce3bf87d3d3191b8aad24bf4d22854129515c2"
+    "patches/chromium/iris_080_linux_build.patch": "b60b5c2f100af44beaa81d39922a7bc66d7d35a5b8bcf4b4f2a949166e546e16"
   },
   "inputs": {
     "profiles/windows-desktop.json": "9b8183b812b7a3f8224d5f860f7176f0716138746711b057a8f822561e0338a6",

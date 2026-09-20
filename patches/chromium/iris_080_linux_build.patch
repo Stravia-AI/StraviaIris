@@ -1,20 +1,21 @@
-目的：锁定 enable_supervised_users=false 时修复 Linux GN 生成失败。
+目的：锁定 enable_supervised_users=false 时修复 GN 生成失败。
 来源：原创 StraviaIris；基线 https://chromium.googlesource.com/chromium/src/+/79460ebecaa5625e57a5fb679a735659e73dc687
 许可：保留 Chromium BSD 许可。
-验收：linux gn gen 不再因 chrome_app_unittests 断言 enable_supervised_users 失败；
-该目标仅为测试目标，不在 libcef/cefsimple 构建闭包内。
+验收：gn gen 不再因 chrome/test 顶层断言中断；chrome_app_unittests 等测试
+目标不在 libcef/cefsimple 构建闭包内，supervised_user 相关目标均为无条件定义，
+移除断言仅影响测试可构建性检查，不影响引擎产物。
 
 diff --git BUILD.gn BUILD.gn
 --- BUILD.gn
 +++ BUILD.gn
-@@ -25,6 +25,7 @@
+@@ -25,5 +25,6 @@
  import("//chrome/browser/buildflags.gni")
  import("//chrome/enterprise_companion/buildflags.gni")
  import("//components/enterprise/buildflags/buildflags.gni")
 +import("//components/supervised_user/buildflags.gni")
  import("//device/vr/buildflags/buildflags.gni")
  import("//extensions/buildflags/buildflags.gni")
-@@ -601,7 +601,7 @@
+@@ -601,6 +602,6 @@
        ]
  
 -      if (!is_castos) {
@@ -22,4 +23,14 @@ diff --git BUILD.gn BUILD.gn
          deps += [ "//chrome/test:chrome_app_unittests" ]
        }
  
-       if (!is_debug && !is_component_build && !is_castos) {
+diff --git chrome/test/BUILD.gn chrome/test/BUILD.gn
+--- chrome/test/BUILD.gn
++++ chrome/test/BUILD.gn
+@@ -55,6 +55,6 @@
+ assert(!is_ios, "Chromium/iOS shouldn't use anything in //chrome")
+ assert(!is_fuchsia, "Fuchsia shouldn't use anything in //chrome")
+-assert(enable_supervised_users)
++# StraviaIris：引擎锁定关闭该特性；测试目标不参与引擎构建。
+ 
+ if (is_android) {
+   import("//build/config/android/rules.gni")

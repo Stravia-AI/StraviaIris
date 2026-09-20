@@ -73,6 +73,10 @@ class CI:
                         DEPOT_TOOLS_METRICS="0", CIPD_CACHE_ENABLED="0")
         if IS_WINDOWS:
             self.env["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
+        if self.pcfg["cpu"] == "arm64":
+            # windows-2022 是 x64 宿主交叉编译 arm64；CEF 的 gn_args 仅在
+            # arm64 宿主或该开关下才把 Release_GN_arm64 列入支持配置。
+            self.env["CEF_ENABLE_ARM64"] = "1"
         self.env["PATH"] = str(self.root / "depot_tools") + os.pathsep + self.env.get("PATH", "")
         self.env["GN_DEFINES"] = " ".join(
             f"{name}={json.dumps(value)}" for name, value in self.build_args.items())
