@@ -172,6 +172,16 @@ class CI:
             # 续跑场景同样要跑（归档里的 depot_tools 可能未引导）。
             self.run(["bash", self.root / "depot_tools/ensure_bootstrap"],
                      cwd=self.root / "depot_tools")
+        chromium = self.root / "chromium"
+        chromium.mkdir(exist_ok=True)
+        gclient = chromium / ".gclient"
+        # 无守卫重写：续跑工作区里的旧 .gclient 也要更新到新字段；
+        # 提前到 fetched 短路之前，自愈分支的 gclient 调用同样依赖它。
+        solution = {"managed": False, "name": "src",
+                    "url": self.lock["chromium"]["url"] + "@" + self.lock["chromium"]["commit"],
+                    "custom_vars": {"checkout_pgo_profiles": False, "source_tarball": False},
+                    "custom_deps": {}, "deps_file": "DEPS", "safesync_url": ""}
+        gclient.write_text("solutions = " + repr([solution]) + "\n", encoding="utf-8")
         if self.state.get("fetched"):
             intact = True
             if not self.state.get("generated"):
@@ -182,13 +192,29 @@ class CI:
                              for key, path in (("chromium", self.src), ("cef", self.cef)))
             if intact:
                 self.revisions()
+                # automate 的 nohistory 续跑路径见 src/ 存在即整体早退：
+                # 首段 sync 中断的工作区会被标成 fetched 但 deps 与
+                # runhooks（含工具链钩子）都没补跑。重放 sync/runhooks 幂等
+                # 补齐，但仅在没打过补丁时安全（gclient 会动 dep 检出）。
+                # iris_000 只碰 src 主仓与 src/cef 副本，属安全例外。
+                safe_applied = {"iris_000_profile"}
+                if (not self.state.get("applied") and not self.state.get("hooks_done")
+                        and set(self.state.get("applied_patches") or ()) <= safe_applied):
+                    self.patch_deps_gperf()
+                    self.run(["gclient.bat" if IS_WINDOWS else "gclient",
+                             "sync", "--nohooks", "--no-history"], cwd=chromium)
+                    self.run(["gclient.bat" if IS_WINDOWS else "gclient",
+                             "runhooks"], cwd=chromium)
+                    self.state["hooks_done"] = True
+                    save(self.state_path, self.state)
                 print("源码已同步且修订匹配；跳过 fetch。")
                 return
             print("接力工作区源码残缺；清空 chromium 目录重新同步。", flush=True)
             shutil.rmtree(self.src, ignore_errors=True)
             shutil.rmtree(self.root / "cef", ignore_errors=True)
             for flag in ("fetched", "applied", "applied_patches", "deps_installed",
-                         "generated", "built", "packaged", "ninja_targets"):
+                         "generated", "built", "packaged", "ninja_targets",
+                         "hooks_done"):
                 self.state.pop(flag, None)
             save(self.state_path, self.state)
         url = f"https://raw.githubusercontent.com/chromiumembedded/cef/{self.lock['cef']['commit']}/tools/automate/automate-git.py"
@@ -206,15 +232,6 @@ class CI:
         help_text = self.run([sys.executable, automate, "--help"], capture=True)
         missing = [arg for arg in args if arg.split("=")[0] not in help_text]
         require(not missing, f"固定 automate 参数不兼容：{missing}")
-        chromium = self.root / "chromium"
-        chromium.mkdir(exist_ok=True)
-        gclient = chromium / ".gclient"
-        # 无守卫重写：续跑工作区里的旧 .gclient 也要更新到新字段。
-        solution = {"managed": False, "name": "src",
-                    "url": self.lock["chromium"]["url"] + "@" + self.lock["chromium"]["commit"],
-                    "custom_vars": {"checkout_pgo_profiles": False, "source_tarball": False},
-                    "custom_deps": {}, "deps_file": "DEPS", "safesync_url": ""}
-        gclient.write_text("solutions = " + repr([solution]) + "\n", encoding="utf-8")
         # 被取消的分段会把解压到一半的工作区重新打包接力：src/ 存在但
         # 没有 VERSION 时 automate 的 --no-chromium-history 版本检查直接炸，
         # 且这种归档往往连 .iris-ci.json 都没解出来，上面的完整性检查兜不住。
@@ -223,21 +240,35 @@ class CI:
             shutil.rmtree(self.src, ignore_errors=True)
             shutil.rmtree(self.root / "cef", ignore_errors=True)
             for flag in ("fetched", "applied", "applied_patches", "deps_installed",
-                         "generated", "built", "packaged", "ninja_targets"):
+                         "generated", "built", "packaged", "ninja_targets",
+                         "hooks_done"):
                 self.state.pop(flag, None)
             save(self.state_path, self.state)
+        # 半解包接力归档里根级 cef / src/cef 也可能是残缺检出（.git 缺失
+        # 或 HEAD 不符）：automate 会校验根级 cef 并把 src/cef 当作已复制，
+        # 提前清掉让它重新克隆/复制。
+        for cef_dir in (self.root / "cef", self.cef):
+            if cef_dir.exists() and not self.head_matches(cef_dir, self.lock["cef"]["commit"]):
+                print(f"cef 检出损坏或修订不符，清除：{cef_dir}", flush=True)
+                shutil.rmtree(cef_dir, ignore_errors=True)
         self.patch_deps_gperf()
         try:
             self.run([sys.executable, automate, *args])
         except subprocess.CalledProcessError:
-            # 首次同步时 DEPS 还不存在，gperf cipd dep 会先炸一次；
-            # 此时 DEPS 已检出，补刀后让 automate 自己续同步。
+            # 首次同步时 DEPS 还不存在，gperf cipd dep 会先炸一次。
+            # automate 的 nohistory 续跑路径见 src/ 存在即整体早退，既不
+            # 续 sync 也不跑 runhooks，只能手动补完 sync 后再交给 automate
+            # 做 cef 复制等收尾，最后补跑 runhooks（工具链钩子）。
             if self.platform != "linux-arm64" or not (self.src / "DEPS").is_file():
                 raise
             self.patch_deps_gperf()
+            self.run(["gclient.bat" if IS_WINDOWS else "gclient",
+                             "sync", "--nohooks", "--no-history"], cwd=chromium)
             self.run([sys.executable, automate, *args])
+            self.run(["gclient.bat" if IS_WINDOWS else "gclient",
+                             "runhooks"], cwd=chromium)
         self.revisions()
-        self.save_state("apply", fetched=True)
+        self.save_state("apply", fetched=True, hooks_done=True)
 
     def patch_deps_gperf(self):
         """cipd 没有 gperf/linux-arm64 包，而 gclient 对 cipd dep 硬编码
@@ -256,6 +287,8 @@ class CI:
             return
         end = text.find("\n  '", start + len(marker))
         block = text[start:end if end > 0 else len(text)]
+        if 'host_cpu != "arm64"' in block:
+            return  # 已收窄过（幂等：自愈/重试路径会重复调用）
         patched = block.replace(
             "'condition': 'host_os == \"linux\" and non_git_source'",
             "'condition': 'host_os == \"linux\" and host_cpu != \"arm64\" and non_git_source'")
@@ -364,24 +397,31 @@ class CI:
                     self._cfg_append(cfg, name)
             existing = [entry["name"] for entry in literal_assignment(cfg, "patches")]
         require(existing[-len(NAMES):] == list(NAMES), "自有补丁必须位于 CEF 队列末尾")
-        # 只跑 iris 自有补丁：CEF 上游条目由 fetch 阶段的 gclient runhooks
-        # 对原始树一次性应用；续跑重放会因后续补丁改变上下文而以 'fail'
-        # 退出（既非 skip 也非 success），纯属噪声且会中断管线。
-        # 同理，iris 补丁之间也可能互相改上下文：patcher 的
-        # --reverse --check "已应用" 探测对已重叠的补丁同样失效，
-        # 所以以状态文件里的 applied_patches 清单为准，只跑未记录的。
+        # automate --no-build 不跑 gclient_hook.py，上游补丁同样由这里应用。
+        # patcher 的 --reverse --check "已应用" 探测对上下文被后续补丁改动
+        # 的条目不可靠（正反向均 fail，如 embedder_product_override 与
+        # iris_010 重叠），所以以 applied_patches 清单为准：每个条目只跑
+        # 未记录的，成功即落盘，中断续跑从断点继续。
+        patches = literal_assignment(cfg, "patches")
         applied = self.state.get("applied_patches")
         if applied is None:
-            # 旧格式工作区：applied 为真时按 state.patches 迁移已应用清单。
-            applied = ([n for n in NAMES
-                        if f"patches/chromium/{n}.patch" in (self.state.get("patches") or {})]
+            # 旧格式工作区：applied 为真表示整条队列曾跑完，上游条目全部
+            # 迁移为已应用，iris 补丁按旧 state.patches 记录迁移。
+            applied = ([e["name"] for e in patches if e["name"] not in NAMES]
+                       + [n for n in NAMES
+                          if f"patches/chromium/{n}.patch" in (self.state.get("patches") or {})]
                        if self.state.get("applied") else [])
             self.state["applied_patches"] = applied
         done = set(applied)
-        patches = literal_assignment(cfg, "patches")
         for entry in patches:
             name = entry["name"]
-            if name not in NAMES or name in done:
+            if name in done:
+                continue
+            if "condition" in entry and entry["condition"] not in self.env:
+                # 与 patcher 配置模式一致：环境变量未设置则跳过并记录。
+                applied.append(name)
+                self.state["applied_patches"] = applied
+                save(self.state_path, self.state)
                 continue
             target_root = (self.src / entry.get("path", "")).resolve()
             require(target_root.is_relative_to(self.src), "补丁目标越过源码目录")
@@ -394,13 +434,11 @@ class CI:
                 print(error.stdout or "", flush=True)
                 raise
             print(output)
-            require("... successfully applied" in output or "already applied" in output.lower(),
-                    f"自有补丁未实际应用：{name}")
             applied.append(name)
             self.state["applied_patches"] = applied
             save(self.state_path, self.state)
-        missing = [n for n in NAMES if n not in applied]
-        require(not missing, f"自有补丁未全部就位：{missing}")
+        missing = [e["name"] for e in patches if e["name"] not in applied]
+        require(not missing, f"补丁队列未全部就位：{missing}")
         build_id = self.prepare_inputs()
         self.save_state("gen", applied=True, patches=hashes, engine_build_id=build_id)
 
@@ -572,7 +610,12 @@ class CI:
     # 编排
     # ------------------------------------------------------------------
     def run_pipeline(self, segment_seconds):
-        require(not self.state.get("error"), f"上次分段硬失败：{self.state.get('error')}")
+        if self.state.get("error"):
+            # error 只记录上一段的失败现场；接力 run 总是携带最新代码，
+            # 已修复的问题不应被旧标记永久锁死，重试仍失败会重新写入。
+            print(f"清除上次失败标记后重试：{self.state['error']}", flush=True)
+            self.state.pop("error")
+            save(self.state_path, self.state)
         deadline = time.time() + segment_seconds if segment_seconds else self.deadline()
         # 各阶段幂等：已完成阶段自查标记跳过，逐段推进到下一个未完成阶段。
         self.fetch()
