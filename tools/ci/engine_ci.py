@@ -182,6 +182,24 @@ class CI:
         self.save_state("apply", fetched=True)
 
     # ------------------------------------------------------------------
+    # 阶段：deps —— Linux 宿主编译依赖（fetch 之后才有脚本本体）
+    # ------------------------------------------------------------------
+    def deps(self):
+        if IS_WINDOWS or self.state.get("deps_installed"):
+            return
+        script = self.src / "build/install-build-deps.sh"
+        if script.is_file():
+            args = ["sudo", "DEBIAN_FRONTEND=noninteractive", "bash", str(script),
+                    "--no-prompt", "--no-arm", "--no-chromeos-fonts"]
+            print("+ " + subprocess.list2cmdline(args), flush=True)
+            result = subprocess.run(args, cwd=self.src, env=self.env)
+            if result.returncode:
+                # 上游脚本对个别可选包失败属常态；编译会暴露真实缺失。
+                print(f"::warning::install-build-deps 退出码 {result.returncode}，继续", flush=True)
+        self.state["deps_installed"] = True
+        save(self.state_path, self.state)
+
+    # ------------------------------------------------------------------
     # 阶段：apply —— 注册并按序应用补丁队列 + 注入 profile/协议输入
     # ------------------------------------------------------------------
     def queue(self):
@@ -406,6 +424,7 @@ class CI:
         deadline = time.time() + segment_seconds if segment_seconds else self.deadline()
         # 各阶段幂等：已完成阶段自查标记跳过，逐段推进到下一个未完成阶段。
         self.fetch()
+        self.deps()
         self.apply()
         self.gen()
         if not self.state.get("built"):
