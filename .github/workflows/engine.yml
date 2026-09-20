@@ -130,6 +130,8 @@ jobs:
       IRIS_SIB: ${{ matrix.sib }}
       # artifact 上传/下载会在 tmpdir 里先打 zip，也必须落在挂载盘。
       TMPDIR: ${{ matrix.sib }}/tmp
+      # Windows runner 控制台是 cp1252，脚本中文输出会 UnicodeEncodeError。
+      PYTHONUTF8: "1"
     steps:
       - name: 记录本段硬截止时间
         shell: bash
