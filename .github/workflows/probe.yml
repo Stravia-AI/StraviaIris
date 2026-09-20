@@ -1,0 +1,31 @@
+name: probe
+# 一次性诊断：查看 runner 裸机磁盘/内存布局，定位根盘写爆问题。
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "runner label"
+        default: "ubuntu-24.04-arm"
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: 裸机状态
+        shell: bash
+        run: |
+          echo "== df =="; df -h
+          echo "== lsblk =="; lsblk || true
+          echo "== mem =="; free -h
+          echo "== big dirs =="; sudo du -xsh /opt/hostedtoolcache /usr/local/lib /usr/share /home/runner 2>/dev/null | sort -h | tail -15
+
+      - name: 清理后状态
+        shell: bash
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/* \
+            /usr/local/lib/node_modules /usr/local/lib/heroku \
+            /usr/local/lib/aws-cli /usr/local/lib/aws-sam-cli \
+            /usr/share/swift /usr/share/miniconda /usr/lib/mono 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h / /mnt
