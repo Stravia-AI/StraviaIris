@@ -153,6 +153,11 @@ class CI:
         self.run(["git", "-C", self.root / "depot_tools", "checkout", "--detach", depot["commit"]])
         if IS_WINDOWS:
             self.bootstrap_windows()
+        else:
+            # DEPOT_TOOLS_UPDATE=0 下自动引导被跳过；gn 包装器需要
+            # ensure_bootstrap 写出的 python3_bin_reldir.txt 等文件。
+            self.run(["bash", self.root / "depot_tools/ensure_bootstrap"],
+                     cwd=self.root / "depot_tools")
         url = f"https://raw.githubusercontent.com/chromiumembedded/cef/{self.lock['cef']['commit']}/tools/automate/automate-git.py"
         automate = self.root / "automate-git.py"
         if not automate.is_file() or digest(automate) != self.lock["automate"]["sha256"]:
@@ -171,12 +176,15 @@ class CI:
         chromium = self.root / "chromium"
         chromium.mkdir(exist_ok=True)
         gclient = chromium / ".gclient"
-        if not gclient.is_file():
-            solution = {"managed": False, "name": "src",
-                        "url": self.lock["chromium"]["url"] + "@" + self.lock["chromium"]["commit"],
-                        "custom_vars": {"checkout_pgo_profiles": False, "source_tarball": False},
-                        "custom_deps": {}, "deps_file": "DEPS", "safesync_url": ""}
-            gclient.write_text("solutions = " + repr([solution]) + "\n", encoding="utf-8")
+        # 无守卫重写：续跑工作区里的旧 .gclient 也要更新到新字段。
+        solution = {"managed": False, "name": "src",
+                    "url": self.lock["chromium"]["url"] + "@" + self.lock["chromium"]["commit"],
+                    "custom_vars": {"checkout_pgo_profiles": False, "source_tarball": False},
+                    # cipd 没有 gperf 的 linux-arm64 包；Linux 构建走系统 gperf，
+                    # custom_deps=None 仅跳过这一个 dep（sysroot 等不动）。
+                    "custom_deps": {"src/third_party/gperf/cipd": None},
+                    "deps_file": "DEPS", "safesync_url": ""}
+        gclient.write_text("solutions = " + repr([solution]) + "\n", encoding="utf-8")
         self.run([sys.executable, automate, *args])
         self.revisions()
         self.save_state("apply", fetched=True)
