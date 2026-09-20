@@ -79,12 +79,14 @@ class Engine:
                 "is_official_build": True, "is_component_build": False,
                 "chrome_pgo_phase": 0, "proprietary_codecs": True,
                 "ffmpeg_branding": "Chrome", "symbol_level": 0,
-                "safe_browsing_mode": 0,
+                # safe_browsing_mode=1 / screen_ai=true 是上游桌面默认；
+                # //chrome 全图有文件级断言硬性依赖（reset_password 断言
+                # safe_browsing_mode==1，screen_ai/pdf 等 8 处断言服务开关），
+                # 关闭无法通过 gn gen。运行时是否启用由 prefs/补丁层决定。
+                "safe_browsing_mode": 1,
                 "enable_mdns": False, "enable_captive_portal_detection": False,
-                # 上游桌面平台默认即 true；//chrome 全图多处文件级断言
-                # 依赖它，置 false 无法通过 gn gen，保持上游默认。
                 "enable_supervised_users": True,
-                "enable_screen_ai_service": False,
+                "enable_screen_ai_service": True,
                 "include_transport_security_state_preload_list": False},
                 "锁文件构建参数不符合此基线")
         require(self.lock["build_targets"] == ["libcef", "bootstrap", "bootstrapc", "cefsimple"],

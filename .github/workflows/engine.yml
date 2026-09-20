@@ -57,6 +57,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RESUME_FROM: ${{ inputs.resume_from }}
           TAG_IN: ${{ inputs.tag }}
+          HOP_IN: ${{ inputs.hop }}
           PLATFORMS_IN: ${{ inputs.platforms }}
           RUNNER_WINDOWS_X64: ${{ vars.RUNNER_WINDOWS_X64 }}
           RUNNER_WINDOWS_ARM64: ${{ vars.RUNNER_WINDOWS_ARM64 }}
@@ -102,7 +103,9 @@ jobs:
                gh run download "$RESUME_FROM" -n "iris-state-$p" -D "/tmp/st-$p" >/dev/null 2>&1; then
               phase=$(jq -r '.phase // ""' "/tmp/st-$p/state.json" 2>/dev/null || true)
               err=$(jq -r '.error // ""' "/tmp/st-$p/state.json" 2>/dev/null || true)
-              if [ "$phase" = "done" ] || [ -n "$err" ]; then
+              # 自动接力（hop>0）遇 error 直接放弃该平台，防止无望循环；
+              # hop=0 的手动派发视为带新代码重试，驱动会清 error 继续。
+              if [ "$phase" = "done" ] || { [ "${HOP_IN:-0}" != "0" ] && [ -n "$err" ]; }; then
                 echo "skip $p：上一段 phase=$phase error=$err"; continue
               fi
             fi
