@@ -14,7 +14,6 @@ import sys
 import urllib.request
 import uuid
 
-from engine_doctor import diagnose
 import engine_patches
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -115,6 +114,9 @@ class Engine:
         self.env["GIT_CONFIG_COUNT"] = str(count)
 
     def doctor(self):
+        # 仅在 Windows 构建机上可用；延迟导入以便 CI 在 Linux 上复用本模块的
+        # 纯工具函数（engine_doctor 顶层依赖 ctypes.wintypes）。
+        from engine_doctor import diagnose
         result = diagnose(self.root, self.lock["requirements"])
         for check in result["checks"]:
             print(f"{'OK' if check['ok'] else 'FAIL'} {check['name']}: {check['detail']}")

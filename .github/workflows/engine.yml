@@ -1,0 +1,404 @@
+name: engine
+run-name: "engine ${{ inputs.tag || 'auto' }} hop${{ inputs.hop || '0' }}"
+
+# 分段接力构建打补丁的 CEF 引擎并发布 Release。
+#
+# GitHub 免费 runner 单 job 硬上限 6 小时，不足以完成一次 Chromium 编译。
+# 本 workflow 把每个平台切成多个分段：每段下载上一段的完整工作区归档
+# （depot_tools + chromium/src + out/ 增量编译状态），续编到预算耗尽后
+# 重新打包上传；未编完时 continue job 用 gh workflow run 自调度下一个
+# run 接力（workflow_dispatch 是 GITHUB_TOKEN 允许触发新 run 的例外）。
+# 某段编完后直接在该 job 内上传 Release 资产。
+#
+# runner 可由仓库变量覆盖（接入更大/自托管 runner 时无需改 workflow）：
+#   RUNNER_WINDOWS_X64 / RUNNER_WINDOWS_ARM64 / RUNNER_LINUX_X64 / RUNNER_LINUX_ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "逗号分隔平台列表"
+        default: "windows-x64,windows-arm64,linux-x64,linux-arm64"
+      tag:
+        description: "Release tag；留空自动取 engine-<chromium tag>"
+        default: ""
+      resume_from:
+        description: "续跑来源 run id（自动接力时填充，勿手填）"
+        default: ""
+      hop:
+        description: "当前接力序号（自动填充）"
+        default: "0"
+      max_hops:
+        description: "接力次数上限，超出后停止等待人工介入"
+        default: "40"
+      segment_minutes:
+        description: "每段驱动预算（分钟）；job 上限 335min，需为打包上传留余量"
+        default: "255"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: iris-engine-${{ github.repository }}-${{ inputs.tag || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESUME_FROM: ${{ inputs.resume_from }}
+          TAG_IN: ${{ inputs.tag }}
+          PLATFORMS_IN: ${{ inputs.platforms }}
+          RUNNER_WINDOWS_X64: ${{ vars.RUNNER_WINDOWS_X64 }}
+          RUNNER_WINDOWS_ARM64: ${{ vars.RUNNER_WINDOWS_ARM64 }}
+          RUNNER_LINUX_X64: ${{ vars.RUNNER_LINUX_X64 }}
+          RUNNER_LINUX_ARM64: ${{ vars.RUNNER_LINUX_ARM64 }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_IN:-engine-$(jq -r '.chromium.tag' engine.lock.json | sed 's|refs/tags/||')}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release tag: $tag"
+
+          runner_for() {
+            case "$1" in
+              windows-x64)   echo "${RUNNER_WINDOWS_X64:-windows-2022}" ;;
+              windows-arm64) echo "${RUNNER_WINDOWS_ARM64:-windows-2022}" ;;
+              linux-x64)     echo "${RUNNER_LINUX_X64:-ubuntu-22.04}" ;;
+              linux-arm64)   echo "${RUNNER_LINUX_ARM64:-ubuntu-24.04-arm}" ;;
+            esac
+          }
+          root_for() {
+            case "$1" in
+              windows-*) echo 'D:/iris-engine' ;;
+              linux-*)   echo '/cef/iris' ;;
+            esac
+          }
+
+          assets=""
+          if gh release view "$tag" --json assets >/tmp/rel.json 2>/dev/null; then
+            assets=$(jq -r '.assets[].name' /tmp/rel.json)
+          fi
+
+          echo '{"include":[]}' > /tmp/matrix.json
+          IFS=',' read -ra requested <<< "$PLATFORMS_IN"
+          for p in "${requested[@]}"; do
+            p="$(echo "$p" | xargs)"; [ -z "$p" ] && continue
+            if echo "$assets" | grep -qE "stravia-iris-cef-.+-${p}\.(zip|tar\.xz)$"; then
+              echo "skip $p：Release 资产已存在"; continue
+            fi
+            if [ -n "$RESUME_FROM" ] && \
+               gh run download "$RESUME_FROM" -n "iris-state-$p" -D "/tmp/st-$p" >/dev/null 2>&1; then
+              phase=$(jq -r '.phase // ""' "/tmp/st-$p/state.json" 2>/dev/null || true)
+              err=$(jq -r '.error // ""' "/tmp/st-$p/state.json" 2>/dev/null || true)
+              if [ "$phase" = "done" ] || [ -n "$err" ]; then
+                echo "skip $p：上一段 phase=$phase error=$err"; continue
+              fi
+            fi
+            jq --arg p "$p" --arg r "$(runner_for "$p")" --arg root "$(root_for "$p")" \
+               '.include += [{platform:$p,runner:$r,root:$root}]' \
+               /tmp/matrix.json > /tmp/m2.json && mv /tmp/m2.json /tmp/matrix.json
+          done
+          cat /tmp/matrix.json
+          echo "matrix=$(jq -c . /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build-${{ matrix.platform }}
+    needs: plan
+    if: fromJSON(needs.plan.outputs.matrix).include[0] != null
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix).include }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 335
+    env:
+      IRIS_ENGINE_ROOT: ${{ matrix.root }}
+      IRIS_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: 记录本段硬截止时间
+        shell: bash
+        run: echo "IRIS_SEGMENT_END=$(( $(date +%s) + ${{ inputs.segment_minutes }} * 60 ))" >> "$GITHUB_ENV"
+
+      - name: 扩充构建磁盘（Linux）
+        if: runner.os == 'Linux'
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 6144
+          swap-size-mb: 1024
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          build-mount-path: /cef
+
+      - name: Windows 磁盘与工具链检查
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+            "{0}: free {1:N1} GB" -f $_.Name, ($_.Free / 1GB) } | Out-Host
+          $drive = $env:IRIS_ENGINE_ROOT.Substring(0,1)
+          $ps = Get-PSDrive $drive -ErrorAction SilentlyContinue
+          $free = if ($ps) { $ps.Free / 1GB } else { 0 }
+          if ($free -lt 100) {
+            $c = (Get-PSDrive C).Free / 1GB
+            if ($c -gt $free) {
+              "IRIS_ENGINE_ROOT=C:/iris-engine" | Out-File $env:GITHUB_ENV -Append
+              Write-Warning "$drive 盘余量不足（${free}GB），改用 C:/iris-engine（${c}GB）"
+            }
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -property installationPath
+          & $vswhere -latest -property catalog_productDisplayVersion
+
+      - name: 准备工作区目录
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo mkdir -p "$(dirname "$IRIS_ENGINE_ROOT")"
+            sudo chown -R "$USER" "$(dirname "$IRIS_ENGINE_ROOT")"
+          fi
+          mkdir -p "$IRIS_ENGINE_ROOT"
+          df -h "$(dirname "$IRIS_ENGINE_ROOT")" || true
+
+      - name: Windows arm64 编译组件检查/安装
+        if: runner.os == 'Windows' && matrix.platform == 'windows-arm64'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($cl) { Write-Host "arm64 cl.exe: $($cl.FullName)"; exit 0 }
+          Write-Host "缺少 MSVC arm64 工具集，正在安装..."
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" modify `
+            --installPath "$vs" --quiet --wait --norestart `
+            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            --add Microsoft.VisualStudio.Component.VC.ATLMFC.ARM64
+          if ($LASTEXITCODE -ne 0) { throw "VS 组件安装失败：$LASTEXITCODE" }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/checkout@v4
+
+      - name: 下载上一分段工作区
+        if: inputs.resume_from != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: iris-ws-${{ matrix.platform }}
+          path: ${{ runner.temp }}/iris-ws
+          run-id: ${{ inputs.resume_from }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 解压工作区
+        shell: bash
+        run: |
+          archive=$(find "${{ runner.temp }}/iris-ws" -name 'ws.tar.zst' 2>/dev/null | head -1 || true)
+          if [ -n "$archive" ]; then
+            python tools/ci/ws_archive.py unpack --archive "$archive" --root "$IRIS_ENGINE_ROOT"
+          else
+            echo "无可恢复工作区，本段从零开始"
+          fi
+
+      - name: 安装 Linux 宿主依赖
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -x
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git python3 python3-pip curl ca-certificates lsb-release file \
+            build-essential pkg-config zstd xz-utils gperf ninja-build sudo
+          deps="$IRIS_ENGINE_ROOT/chromium/src/build/install-build-deps.sh"
+          if [ -f "$deps" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive "$deps" --no-prompt --no-arm --no-chromeos-fonts || \
+              echo "::warning::install-build-deps 部分失败，继续（编译会暴露真实缺失）"
+          fi
+
+      - name: 驱动分段构建
+        id: drive
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
+          python tools/ci/engine_ci.py --root "$IRIS_ENGINE_ROOT" \
+            --platform "$IRIS_PLATFORM" \
+            2>&1 | tee "${{ runner.temp }}/iris-build.log"
+          code=${PIPESTATUS[0]}
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          echo "==== 分段退出码：$code（0=完成发布候选，75=预算耗尽交接）===="
+          [ "$code" = "75" ] && exit 0
+          exit $code
+
+      - name: 发布资产（本段编完时）
+        if: steps.drive.outputs.exit == '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            gh release view "$TAG" >/dev/null 2>&1 && break
+            gh release create "$TAG" --title "$TAG" --target "${{ github.sha }}" \
+              --notes "StraviaIris 打补丁 CEF 引擎构建（分段接力）" || sleep 8
+          done
+          gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" "$IRIS_ENGINE_ROOT/package/"* --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'
+
+      - name: 打包工作区交棒（未编完时）
+        if: always() && steps.drive.outputs.exit != '0'
+        shell: bash
+        run: |
+          exclude=""
+          if grep -q '"generated": *true' "$IRIS_ENGINE_ROOT/.iris-ci.json" 2>/dev/null; then
+            exclude="--exclude chromium/src/.git"
+          fi
+          python tools/ci/ws_archive.py pack --root "$IRIS_ENGINE_ROOT" \
+            --output "${{ runner.temp }}/ws.tar.zst" $exclude
+
+      - name: 上传工作区工件
+        if: always() && steps.drive.outputs.exit != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-ws-${{ matrix.platform }}
+          path: ${{ runner.temp }}/ws.tar.zst
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: 收集状态与日志
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/iris-state" "${{ runner.temp }}/iris-logs"
+          cp "$IRIS_ENGINE_ROOT/.iris-ci.json" "${{ runner.temp }}/iris-state/state.json" 2>/dev/null || \
+            echo '{"phase":"unknown"}' > "${{ runner.temp }}/iris-state/state.json"
+          cp "${{ runner.temp }}/iris-build.log" "${{ runner.temp }}/iris-logs/" 2>/dev/null || true
+          tail -5 "${{ runner.temp }}/iris-build.log" 2>/dev/null || true
+
+      - name: 状态工件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-state-${{ matrix.platform }}
+          path: ${{ runner.temp }}/iris-state/state.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 日志工件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-log-${{ matrix.platform }}-hop${{ inputs.hop }}
+          path: ${{ runner.temp }}/iris-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 分段摘要
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.platform }} hop${{ inputs.hop }}"
+            echo "- 驱动退出码：${{ steps.drive.outputs.exit }}"
+            python - "$IRIS_ENGINE_ROOT/.iris-ci.json" <<'PY' || true
+          import json, sys
+          try:
+              s = json.load(open(sys.argv[1], encoding="utf-8"))
+              for k, v in s.items():
+                  print(f"- {k}: {v}")
+          except OSError:
+              print("- 无状态文件")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  continue:
+    name: 接力调度
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        if: needs.build.result != 'skipped'
+        with:
+          pattern: iris-state-*
+          path: /tmp/states
+
+      - name: 计算待续平台
+        id: next
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          HOP: ${{ inputs.hop }}
+          MAX_HOPS: ${{ inputs.max_hops }}
+        run: |
+          set -euo pipefail
+          pending=""
+          for p in $(echo "$MATRIX" | jq -r '.include[].platform'); do
+            state="/tmp/states/iris-state-$p/state.json"
+            phase=$(jq -r '.phase // ""' "$state" 2>/dev/null || true)
+            err=$(jq -r '.error // ""' "$state" 2>/dev/null || true)
+            echo "platform=$p phase=${phase:-missing} error=$err"
+            [ "$phase" = "done" ] && continue
+            [ -n "$err" ] && continue
+            pending="$pending $p"
+          done
+          pending="$(echo "$pending" | xargs | tr ' ' ',')"
+          next_hop=$(( ${HOP:-0} + 1 ))
+          over=0
+          if [ -n "$pending" ] && [ "$next_hop" -gt "${MAX_HOPS:-40}" ]; then over=1; fi
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          echo "over_limit=$over" >> "$GITHUB_OUTPUT"
+          echo "pending=${pending:-none} next_hop=$next_hop over_limit=$over"
+
+      - name: 收尾 Release 说明（全部完成时）
+        if: steps.next.outputs.pending == ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            assets=$(gh release view "$TAG" --json assets \
+              --jq '.assets[] | select(.name|endswith(".sha256")|not) | "- `\(.name)` \(.size/1e6|floor)MB"' | sort)
+            printf 'StraviaIris 打补丁 CEF 引擎构建（分段接力）。\n\n%s\n\nSHA-256 校验文件随同名资产发布。\n' "$assets" > /tmp/notes.md
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+            gh release view "$TAG"
+          else
+            echo "无 Release 需要收尾"
+          fi
+
+      - name: 调度下一接力 run
+        if: steps.next.outputs.pending != '' && steps.next.outputs.over_limit == '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          next_hop=$(( ${{ inputs.hop || 0 }} + 1 ))
+          gh workflow run engine.yml --ref main \
+            -f "platforms=${{ steps.next.outputs.pending }}" \
+            -f "tag=${{ needs.plan.outputs.tag }}" \
+            -f "resume_from=${{ github.run_id }}" \
+            -f "hop=$next_hop" \
+            -f "max_hops=${{ inputs.max_hops }}" \
+            -f "segment_minutes=${{ inputs.segment_minutes }}"
+          echo "已调度 hop$next_hop：platforms=${{ steps.next.outputs.pending }} resume_from=${{ github.run_id }}"
+
+      - name: 接力上限告警
+        if: steps.next.outputs.over_limit == '1'
+        run: |
+          echo "::error::达到接力上限 ${{ inputs.max_hops }}，待续平台：${{ steps.next.outputs.pending }}。修复后用 resume_from=${{ github.run_id }} 手动续跑。"
+          exit 1
