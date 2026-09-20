@@ -103,6 +103,10 @@ class CI:
     def revisions(self):
         for key, path in (("cef", self.cef), ("chromium", self.src),
                           ("depot_tools", self.root / "depot_tools")):
+            if not (path / ".git").exists():
+                # 生成后分段归档会剔除 src/.git 瘦身；锁定校验在首段已完成。
+                print(f"{key}: 无 .git（归档已精简），跳过修订校验")
+                continue
             require(self.git(path, "rev-parse", "HEAD") == self.lock[key]["commit"],
                     f"{key} revision 不匹配")
 
@@ -142,10 +146,6 @@ class CI:
                   self.root / "depot_tools/gsutil.py", "version"])
 
     def fetch(self):
-        if self.state.get("fetched"):
-            self.revisions()
-            print("源码已同步且修订匹配；跳过 fetch。")
-            return
         depot = self.lock["depot_tools"]
         self.root.mkdir(parents=True, exist_ok=True)
         if not (self.root / "depot_tools/.git").exists():
@@ -156,8 +156,13 @@ class CI:
         else:
             # DEPOT_TOOLS_UPDATE=0 下自动引导被跳过；gn 包装器需要
             # ensure_bootstrap 写出的 python3_bin_reldir.txt 等文件。
+            # 续跑场景同样要跑（归档里的 depot_tools 可能未引导）。
             self.run(["bash", self.root / "depot_tools/ensure_bootstrap"],
                      cwd=self.root / "depot_tools")
+        if self.state.get("fetched"):
+            self.revisions()
+            print("源码已同步且修订匹配；跳过 fetch。")
+            return
         url = f"https://raw.githubusercontent.com/chromiumembedded/cef/{self.lock['cef']['commit']}/tools/automate/automate-git.py"
         automate = self.root / "automate-git.py"
         if not automate.is_file() or digest(automate) != self.lock["automate"]["sha256"]:

@@ -277,9 +277,14 @@ jobs:
         if: always() && steps.drive.outputs.exit != '0'
         shell: bash
         run: |
-          # .git 必须随档：续跑时 fetch() 用 git rev-parse 校验锁定修订。
+          # 仅在 GN 生成后剔除 src/.git 瘦身：此前续跑需要它恢复 gclient 检出；
+          # 此后只剩编译/分发，驱动对无 .git 的修订校验已容错。
+          exclude=""
+          if grep -q '"generated": *true' "$IRIS_ENGINE_ROOT/.iris-ci.json" 2>/dev/null; then
+            exclude="--exclude chromium/src/.git"
+          fi
           python tools/ci/ws_archive.py pack --root "$IRIS_ENGINE_ROOT" \
-            --output "$IRIS_SIB/ws.tar.zst"
+            --output "$IRIS_SIB/ws.tar.zst" $exclude
 
       - name: 上传工作区工件
         if: always() && steps.drive.outputs.exit != '0'
