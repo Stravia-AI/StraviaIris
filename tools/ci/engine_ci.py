@@ -362,9 +362,14 @@ class CI:
                 continue
             target_root = (self.src / entry.get("path", "")).resolve()
             require(target_root.is_relative_to(self.src), "补丁目标越过源码目录")
-            output = self.run([sys.executable, self.cef / "tools/patcher.py",
-                               "--patch-file", name, "--patch-dir", target_root],
-                              cwd=self.cef, capture=True)
+            try:
+                output = self.run([sys.executable, self.cef / "tools/patcher.py",
+                                   "--patch-file", name, "--patch-dir", target_root],
+                                  cwd=self.cef, capture=True)
+            except subprocess.CalledProcessError as error:
+                # capture=True 时 patcher 的失败详情在 e.stdout，不打出来没法定位。
+                print(error.stdout or "", flush=True)
+                raise
             print(output)
             # 分段中断后重跑时补丁可能已就位；两种情况都视为已应用。
             require("... successfully applied" in output or "already applied" in output.lower(),
