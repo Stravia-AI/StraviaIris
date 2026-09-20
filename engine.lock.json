@@ -47,7 +47,7 @@
     "sha256": "fe0c880fd2a91ac3ab4c82301f596295cecc1901e503507e36300a5b58578dcd"
   },
   "patches": {
-    "patches/cef/0001-register-iris.patch": "1b28ac525acb04fdf4bd25773635387f2d8aedff77ecd153463a185183ccdd37",
+    "patches/cef/0001-register-iris.patch": "0d40ed7762a388de0eadf98c310b25757f3511ce0c0432583f404819008e5385",
     "patches/chromium/iris_000_profile.patch": "81dad9fbaf249cb747711af974473598736470b2d7d471f84bb60931c7045fd9",
     "patches/chromium/iris_010_identity.patch": "4164d0a2031c138fad599007c81a54ff0276fa76c655ada81660238855999da5",
     "patches/chromium/iris_020_canvas.patch": "f6165b4c486ef9dde3b4870fe9ac9788d87968fe230cc3575d917220c073afd3",

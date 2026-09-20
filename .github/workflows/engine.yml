@@ -135,32 +135,23 @@ jobs:
         shell: bash
         run: echo "IRIS_SEGMENT_END=$(( $(date +%s) + ${{ inputs.segment_minutes }} * 60 ))" >> "$GITHUB_ENV"
 
-      - name: 预清理根盘（Linux）
+      - name: 清理根盘腾空间（Linux）
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # 在 maximize 之前释放根盘，腾出的空间才会并入 LVM 挂载盘。
-          # hostedtoolcache 整个删掉（~10GB+）；setup-python 会自行重装。
+          # 现行 runner 是单盘（~150GB 全在 /，无独立 /mnt 临时盘），
+          # maximize-build-space 之类把 /mnt 当第二盘的方案会把根盘写爆。
+          # 直接清掉无关大块内容，工作区就是根盘上的普通目录。
           df -h /
           sudo rm -rf /opt/hostedtoolcache/* \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
             /usr/local/lib/node_modules /usr/local/lib/heroku \
             /usr/local/lib/aws-cli /usr/local/lib/aws-sam-cli \
             /usr/share/swift /usr/share/miniconda /usr/lib/mono 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
           sudo apt-get clean 2>/dev/null || true
           df -h /
-
-      - name: 扩充构建磁盘（Linux）
-        if: runner.os == 'Linux'
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 12288
-          swap-size-mb: 8192
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
-          remove-codeql: "true"
-          remove-docker-images: "true"
-          build-mount-path: /cef
 
       - name: Windows 磁盘与工具链检查
         if: runner.os == 'Windows'
