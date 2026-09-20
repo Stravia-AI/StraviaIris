@@ -298,21 +298,23 @@ class CI:
                     self._cfg_append(cfg, name)
             existing = [entry["name"] for entry in literal_assignment(cfg, "patches")]
         require(existing[-len(NAMES):] == list(NAMES), "自有补丁必须位于 CEF 队列末尾")
+        # 只跑 iris 自有补丁：CEF 上游条目由 fetch 阶段的 gclient runhooks
+        # 对原始树一次性应用；续跑重放会因后续补丁改变上下文而以 'fail'
+        # 退出（既非 skip 也非 success），纯属噪声且会中断管线。
         patches = literal_assignment(cfg, "patches")
         for entry in patches:
-            if entry.get("condition") and entry["condition"] not in self.env:
-                continue
             name = entry["name"]
+            if name not in NAMES:
+                continue
             target_root = (self.src / entry.get("path", "")).resolve()
             require(target_root.is_relative_to(self.src), "补丁目标越过源码目录")
             output = self.run([sys.executable, self.cef / "tools/patcher.py",
                                "--patch-file", name, "--patch-dir", target_root],
                               cwd=self.cef, capture=True)
-            if name in NAMES:
-                print(output)
-                # 分段中断后重跑时补丁可能已就位；两种情况都视为已应用。
-                require("... successfully applied" in output or "already applied" in output.lower(),
-                        f"自有补丁未实际应用：{name}")
+            print(output)
+            # 分段中断后重跑时补丁可能已就位；两种情况都视为已应用。
+            require("... successfully applied" in output or "already applied" in output.lower(),
+                    f"自有补丁未实际应用：{name}")
         build_id = self.prepare_inputs()
         self.save_state("gen", applied=True, patches=hashes, engine_build_id=build_id)
 

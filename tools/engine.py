@@ -81,7 +81,9 @@ class Engine:
                 "ffmpeg_branding": "Chrome", "symbol_level": 0,
                 "safe_browsing_mode": 0,
                 "enable_mdns": False, "enable_captive_portal_detection": False,
-                "enable_supervised_users": False,
+                # 上游桌面平台默认即 true；//chrome 全图多处文件级断言
+                # 依赖它，置 false 无法通过 gn gen，保持上游默认。
+                "enable_supervised_users": True,
                 "enable_screen_ai_service": False,
                 "include_transport_security_state_preload_list": False},
                 "锁文件构建参数不符合此基线")

@@ -26,7 +26,7 @@
     "safe_browsing_mode": 0,
     "enable_mdns": false,
     "enable_captive_portal_detection": false,
-    "enable_supervised_users": false,
+    "enable_supervised_users": true,
     "enable_screen_ai_service": false,
     "include_transport_security_state_preload_list": false
   },
