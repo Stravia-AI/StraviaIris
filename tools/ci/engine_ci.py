@@ -186,8 +186,9 @@ class CI:
                 return
             print("接力工作区源码残缺；清空 chromium 目录重新同步。", flush=True)
             shutil.rmtree(self.src, ignore_errors=True)
-            for flag in ("fetched", "applied", "deps_installed", "generated",
-                         "built", "packaged", "ninja_targets"):
+            shutil.rmtree(self.root / "cef", ignore_errors=True)
+            for flag in ("fetched", "applied", "applied_patches", "deps_installed",
+                         "generated", "built", "packaged", "ninja_targets"):
                 self.state.pop(flag, None)
             save(self.state_path, self.state)
         url = f"https://raw.githubusercontent.com/chromiumembedded/cef/{self.lock['cef']['commit']}/tools/automate/automate-git.py"
@@ -220,8 +221,9 @@ class CI:
         if self.src.exists() and not (self.src / "chrome/VERSION").is_file():
             print("chromium/src 不完整（缺 VERSION）；清空后重新同步。", flush=True)
             shutil.rmtree(self.src, ignore_errors=True)
-            for flag in ("fetched", "applied", "deps_installed", "generated",
-                         "built", "packaged", "ninja_targets"):
+            shutil.rmtree(self.root / "cef", ignore_errors=True)
+            for flag in ("fetched", "applied", "applied_patches", "deps_installed",
+                         "generated", "built", "packaged", "ninja_targets"):
                 self.state.pop(flag, None)
             save(self.state_path, self.state)
         self.patch_deps_gperf()
@@ -365,10 +367,21 @@ class CI:
         # 只跑 iris 自有补丁：CEF 上游条目由 fetch 阶段的 gclient runhooks
         # 对原始树一次性应用；续跑重放会因后续补丁改变上下文而以 'fail'
         # 退出（既非 skip 也非 success），纯属噪声且会中断管线。
+        # 同理，iris 补丁之间也可能互相改上下文：patcher 的
+        # --reverse --check "已应用" 探测对已重叠的补丁同样失效，
+        # 所以以状态文件里的 applied_patches 清单为准，只跑未记录的。
+        applied = self.state.get("applied_patches")
+        if applied is None:
+            # 旧格式工作区：applied 为真时按 state.patches 迁移已应用清单。
+            applied = ([n for n in NAMES
+                        if f"patches/chromium/{n}.patch" in (self.state.get("patches") or {})]
+                       if self.state.get("applied") else [])
+            self.state["applied_patches"] = applied
+        done = set(applied)
         patches = literal_assignment(cfg, "patches")
         for entry in patches:
             name = entry["name"]
-            if name not in NAMES:
+            if name not in NAMES or name in done:
                 continue
             target_root = (self.src / entry.get("path", "")).resolve()
             require(target_root.is_relative_to(self.src), "补丁目标越过源码目录")
@@ -381,9 +394,13 @@ class CI:
                 print(error.stdout or "", flush=True)
                 raise
             print(output)
-            # 分段中断后重跑时补丁可能已就位；两种情况都视为已应用。
             require("... successfully applied" in output or "already applied" in output.lower(),
                     f"自有补丁未实际应用：{name}")
+            applied.append(name)
+            self.state["applied_patches"] = applied
+            save(self.state_path, self.state)
+        missing = [n for n in NAMES if n not in applied]
+        require(not missing, f"自有补丁未全部就位：{missing}")
         build_id = self.prepare_inputs()
         self.save_state("gen", applied=True, patches=hashes, engine_build_id=build_id)
 
