@@ -86,7 +86,10 @@ class Engine:
                 "safe_browsing_mode": 1,
                 # enable_mdns=false 经 enable_service_discovery 派生触发
                 # local_discovery/extensions mdns 文件级断言，同样回默认。
-                "enable_mdns": True, "enable_captive_portal_detection": False,
+                "enable_mdns": True,
+                # captive_portal 桌面默认 true 且 chrome/browser:core 无条件
+                # 依赖其 target，关掉只会 unresolved dep。
+                "enable_captive_portal_detection": True,
                 "enable_supervised_users": True,
                 "enable_screen_ai_service": True,
                 "include_transport_security_state_preload_list": False},

@@ -25,7 +25,7 @@
     "symbol_level": 0,
     "safe_browsing_mode": 1,
     "enable_mdns": true,
-    "enable_captive_portal_detection": false,
+    "enable_captive_portal_detection": true,
     "enable_supervised_users": true,
     "enable_screen_ai_service": true,
     "include_transport_security_state_preload_list": false
