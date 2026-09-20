@@ -84,7 +84,9 @@ class Engine:
                 # safe_browsing_mode==1，screen_ai/pdf 等 8 处断言服务开关），
                 # 关闭无法通过 gn gen。运行时是否启用由 prefs/补丁层决定。
                 "safe_browsing_mode": 1,
-                "enable_mdns": False, "enable_captive_portal_detection": False,
+                # enable_mdns=false 经 enable_service_discovery 派生触发
+                # local_discovery/extensions mdns 文件级断言，同样回默认。
+                "enable_mdns": True, "enable_captive_portal_detection": False,
                 "enable_supervised_users": True,
                 "enable_screen_ai_service": True,
                 "include_transport_security_state_preload_list": False},
