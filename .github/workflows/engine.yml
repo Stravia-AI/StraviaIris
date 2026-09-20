@@ -220,12 +220,16 @@ jobs:
       - name: 解压工作区
         shell: bash
         run: |
+          rm -f "$IRIS_SIB/ws-ok"
           archive=$(find "$IRIS_SIB/ws-dl" -name 'ws.tar.zst' 2>/dev/null | head -1 || true)
           if [ -n "$archive" ]; then
             python tools/ci/ws_archive.py unpack --archive "$archive" --root "$IRIS_ENGINE_ROOT"
           else
             echo "无可恢复工作区，本段从零开始"
           fi
+          # 解压完整落地才写标记；run 被取消时半解包树没有标记，
+          # 交棒步骤会跳过打包，避免把残缺工作区继续往下传。
+          touch "$IRIS_SIB/ws-ok"
 
       - name: 安装 Linux 宿主依赖
         if: runner.os == 'Linux'
@@ -282,6 +286,10 @@ jobs:
         if: always() && steps.release.conclusion != 'success'
         shell: bash
         run: |
+          if [ ! -f "$IRIS_SIB/ws-ok" ]; then
+            echo "工作区解压未完整（run 被打断）；跳过交棒，下一段从零开始"
+            exit 0
+          fi
           # 仅在 GN 生成后剔除 src/.git 瘦身：此前续跑需要它恢复 gclient 检出；
           # 此后只剩编译/分发，驱动对无 .git 的修订校验已容错。
           exclude=""

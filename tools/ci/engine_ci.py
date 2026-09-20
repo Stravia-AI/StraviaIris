@@ -214,6 +214,16 @@ class CI:
                     "custom_vars": {"checkout_pgo_profiles": False, "source_tarball": False},
                     "custom_deps": {}, "deps_file": "DEPS", "safesync_url": ""}
         gclient.write_text("solutions = " + repr([solution]) + "\n", encoding="utf-8")
+        # 被取消的分段会把解压到一半的工作区重新打包接力：src/ 存在但
+        # 没有 VERSION 时 automate 的 --no-chromium-history 版本检查直接炸，
+        # 且这种归档往往连 .iris-ci.json 都没解出来，上面的完整性检查兜不住。
+        if self.src.exists() and not (self.src / "chrome/VERSION").is_file():
+            print("chromium/src 不完整（缺 VERSION）；清空后重新同步。", flush=True)
+            shutil.rmtree(self.src, ignore_errors=True)
+            for flag in ("fetched", "applied", "deps_installed", "generated",
+                         "built", "packaged", "ninja_targets"):
+                self.state.pop(flag, None)
+            save(self.state_path, self.state)
         self.patch_deps_gperf()
         try:
             self.run([sys.executable, automate, *args])
