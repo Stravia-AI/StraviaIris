@@ -103,8 +103,10 @@ jobs:
                 echo "skip $p：上一段 phase=$phase error=$err"; continue
               fi
             fi
-            jq --arg p "$p" --arg r "$(runner_for "$p")" --arg root "$(root_for "$p")" \
-               '.include += [{platform:$p,runner:$r,root:$root}]' \
+            root="$(root_for "$p")"
+            jq --arg p "$p" --arg r "$(runner_for "$p")" --arg root "$root" \
+               --arg sib "$(dirname "$root")" \
+               '.include += [{platform:$p,runner:$r,root:$root,sib:$sib}]' \
                /tmp/matrix.json > /tmp/m2.json && mv /tmp/m2.json /tmp/matrix.json
           done
           cat /tmp/matrix.json
@@ -123,17 +125,36 @@ jobs:
     env:
       IRIS_ENGINE_ROOT: ${{ matrix.root }}
       IRIS_PLATFORM: ${{ matrix.platform }}
+      # 大文件（工作区归档/下载/日志）一律放挂载盘上的同级目录；
+      # runner.temp 在根盘，几十 GB 归档会把根盘写爆（曾整 job 硬杀）。
+      IRIS_SIB: ${{ matrix.sib }}
+      # artifact 上传/下载会在 tmpdir 里先打 zip，也必须落在挂载盘。
+      TMPDIR: ${{ matrix.sib }}/tmp
     steps:
       - name: 记录本段硬截止时间
         shell: bash
         run: echo "IRIS_SEGMENT_END=$(( $(date +%s) + ${{ inputs.segment_minutes }} * 60 ))" >> "$GITHUB_ENV"
 
+      - name: 预清理根盘（Linux）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # 在 maximize 之前释放根盘，腾出的空间才会并入 LVM 挂载盘。
+          # hostedtoolcache 整个删掉（~10GB+）；setup-python 会自行重装。
+          df -h /
+          sudo rm -rf /opt/hostedtoolcache/* \
+            /usr/local/lib/node_modules /usr/local/lib/heroku \
+            /usr/local/lib/aws-cli /usr/local/lib/aws-sam-cli \
+            /usr/share/swift /usr/share/miniconda /usr/lib/mono 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          df -h /
+
       - name: 扩充构建磁盘（Linux）
         if: runner.os == 'Linux'
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 6144
-          swap-size-mb: 1024
+          root-reserve-mb: 12288
+          swap-size-mb: 8192
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -154,6 +175,7 @@ jobs:
             $c = (Get-PSDrive C).Free / 1GB
             if ($c -gt $free) {
               "IRIS_ENGINE_ROOT=C:/iris-engine" | Out-File $env:GITHUB_ENV -Append
+              "IRIS_SIB=C:" | Out-File $env:GITHUB_ENV -Append
               Write-Warning "$drive 盘余量不足（${free}GB），改用 C:/iris-engine（${c}GB）"
             }
           }
@@ -166,10 +188,10 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             sudo mkdir -p "$(dirname "$IRIS_ENGINE_ROOT")"
-            sudo chown -R "$USER" "$(dirname "$IRIS_ENGINE_ROOT")"
+            sudo chown "$USER" "$(dirname "$IRIS_ENGINE_ROOT")"
           fi
-          mkdir -p "$IRIS_ENGINE_ROOT"
-          df -h "$(dirname "$IRIS_ENGINE_ROOT")" || true
+          mkdir -p "$IRIS_ENGINE_ROOT" "$IRIS_SIB/ws-dl" "$IRIS_SIB/tmp"
+          df -h / "$IRIS_ENGINE_ROOT" "$IRIS_SIB" || true
 
       - name: Windows arm64 编译组件检查/安装
         if: runner.os == 'Windows' && matrix.platform == 'windows-arm64'
@@ -198,14 +220,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: iris-ws-${{ matrix.platform }}
-          path: ${{ runner.temp }}/iris-ws
+          path: ${{ env.IRIS_SIB }}/ws-dl
           run-id: ${{ inputs.resume_from }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 解压工作区
         shell: bash
         run: |
-          archive=$(find "${{ runner.temp }}/iris-ws" -name 'ws.tar.zst' 2>/dev/null | head -1 || true)
+          archive=$(find "$IRIS_SIB/ws-dl" -name 'ws.tar.zst' 2>/dev/null | head -1 || true)
           if [ -n "$archive" ]; then
             python tools/ci/ws_archive.py unpack --archive "$archive" --root "$IRIS_ENGINE_ROOT"
           else
@@ -235,7 +257,7 @@ jobs:
           set +e
           python tools/ci/engine_ci.py --root "$IRIS_ENGINE_ROOT" \
             --platform "$IRIS_PLATFORM" \
-            2>&1 | tee "${{ runner.temp }}/iris-build.log"
+            2>&1 | tee "$IRIS_SIB/iris-build.log"
           code=${PIPESTATUS[0]}
           echo "exit=$code" >> "$GITHUB_OUTPUT"
           echo "==== 分段退出码：$code（0=完成发布候选，75=预算耗尽交接）===="
@@ -251,31 +273,29 @@ jobs:
         run: |
           set -euo pipefail
           for i in 1 2 3 4 5; do
-            gh release view "$TAG" >/dev/null 2>&1 && break
-            gh release create "$TAG" --title "$TAG" --target "${{ github.sha }}" \
+            gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1 && break
+            gh release create "$TAG" -R "${{ github.repository }}" --title "$TAG" \
+              --target "${{ github.sha }}" \
               --notes "StraviaIris 打补丁 CEF 引擎构建（分段接力）" || sleep 8
           done
-          gh release view "$TAG" >/dev/null
-          gh release upload "$TAG" "$IRIS_ENGINE_ROOT/package/"* --clobber
-          gh release view "$TAG" --json assets --jq '.assets[].name'
+          gh release view "$TAG" -R "${{ github.repository }}" >/dev/null
+          gh release upload "$TAG" -R "${{ github.repository }}" "$IRIS_ENGINE_ROOT/package/"* --clobber
+          gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[].name'
 
       - name: 打包工作区交棒（未编完时）
         if: always() && steps.drive.outputs.exit != '0'
         shell: bash
         run: |
-          exclude=""
-          if grep -q '"generated": *true' "$IRIS_ENGINE_ROOT/.iris-ci.json" 2>/dev/null; then
-            exclude="--exclude chromium/src/.git"
-          fi
+          # .git 必须随档：续跑时 fetch() 用 git rev-parse 校验锁定修订。
           python tools/ci/ws_archive.py pack --root "$IRIS_ENGINE_ROOT" \
-            --output "${{ runner.temp }}/ws.tar.zst" $exclude
+            --output "$IRIS_SIB/ws.tar.zst"
 
       - name: 上传工作区工件
         if: always() && steps.drive.outputs.exit != '0'
         uses: actions/upload-artifact@v4
         with:
           name: iris-ws-${{ matrix.platform }}
-          path: ${{ runner.temp }}/ws.tar.zst
+          path: ${{ env.IRIS_SIB }}/ws.tar.zst
           retention-days: 3
           if-no-files-found: ignore
 
@@ -286,8 +306,9 @@ jobs:
           mkdir -p "${{ runner.temp }}/iris-state" "${{ runner.temp }}/iris-logs"
           cp "$IRIS_ENGINE_ROOT/.iris-ci.json" "${{ runner.temp }}/iris-state/state.json" 2>/dev/null || \
             echo '{"phase":"unknown"}' > "${{ runner.temp }}/iris-state/state.json"
-          cp "${{ runner.temp }}/iris-build.log" "${{ runner.temp }}/iris-logs/" 2>/dev/null || true
-          tail -5 "${{ runner.temp }}/iris-build.log" 2>/dev/null || true
+          cp "$IRIS_SIB/iris-build.log" "${{ runner.temp }}/iris-logs/" 2>/dev/null || true
+          tail -5 "$IRIS_SIB/iris-build.log" 2>/dev/null || true
+          df -h / "$IRIS_SIB" 2>/dev/null || true
 
       - name: 状态工件
         if: always()
@@ -371,12 +392,12 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            assets=$(gh release view "$TAG" --json assets \
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            assets=$(gh release view "$TAG" -R "${{ github.repository }}" --json assets \
               --jq '.assets[] | select(.name|endswith(".sha256")|not) | "- `\(.name)` \(.size/1e6|floor)MB"' | sort)
             printf 'StraviaIris 打补丁 CEF 引擎构建（分段接力）。\n\n%s\n\nSHA-256 校验文件随同名资产发布。\n' "$assets" > /tmp/notes.md
-            gh release edit "$TAG" --notes-file /tmp/notes.md
-            gh release view "$TAG"
+            gh release edit "$TAG" -R "${{ github.repository }}" --notes-file /tmp/notes.md
+            gh release view "$TAG" -R "${{ github.repository }}"
           else
             echo "无 Release 需要收尾"
           fi
@@ -389,7 +410,7 @@ jobs:
         run: |
           set -euo pipefail
           next_hop=$(( ${{ inputs.hop || 0 }} + 1 ))
-          gh workflow run engine.yml --ref main \
+          gh workflow run engine.yml -R "${{ github.repository }}" --ref main \
             -f "platforms=${{ steps.next.outputs.pending }}" \
             -f "tag=${{ needs.plan.outputs.tag }}" \
             -f "resume_from=${{ github.run_id }}" \
