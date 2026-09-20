@@ -212,14 +212,45 @@ class CI:
         solution = {"managed": False, "name": "src",
                     "url": self.lock["chromium"]["url"] + "@" + self.lock["chromium"]["commit"],
                     "custom_vars": {"checkout_pgo_profiles": False, "source_tarball": False},
-                    # cipd 没有 gperf 的 linux-arm64 包；Linux 构建走系统 gperf，
-                    # custom_deps=None 仅跳过这一个 dep（sysroot 等不动）。
-                    "custom_deps": {"src/third_party/gperf/cipd": None},
-                    "deps_file": "DEPS", "safesync_url": ""}
+                    "custom_deps": {}, "deps_file": "DEPS", "safesync_url": ""}
         gclient.write_text("solutions = " + repr([solution]) + "\n", encoding="utf-8")
-        self.run([sys.executable, automate, *args])
+        self.patch_deps_gperf()
+        try:
+            self.run([sys.executable, automate, *args])
+        except subprocess.CalledProcessError:
+            # 首次同步时 DEPS 还不存在，gperf cipd dep 会先炸一次；
+            # 此时 DEPS 已检出，补刀后让 automate 自己续同步。
+            if self.platform != "linux-arm64" or not (self.src / "DEPS").is_file():
+                raise
+            self.patch_deps_gperf()
+            self.run([sys.executable, automate, *args])
         self.revisions()
         self.save_state("apply", fetched=True)
+
+    def patch_deps_gperf(self):
+        """cipd 没有 gperf/linux-arm64 包，而 gclient 对 cipd dep 硬编码
+        custom_deps=None（.gclient 无法跳过）。把该 dep 的条件收窄为
+        排除 arm64 宿主；Linux 构建使用系统 gperf（deps 阶段已装）。
+        managed=False 的 .gclient 下本地 DEPS 修改不会被 sync 回滚。"""
+        if self.platform != "linux-arm64":
+            return
+        deps = self.src / "DEPS"
+        if not deps.is_file():
+            return
+        text = deps.read_text(encoding="utf-8")
+        marker = "'src/third_party/gperf/cipd': {"
+        start = text.find(marker)
+        if start < 0:
+            return
+        end = text.find("\n  '", start + len(marker))
+        block = text[start:end if end > 0 else len(text)]
+        patched = block.replace(
+            "'condition': 'host_os == \"linux\" and non_git_source'",
+            "'condition': 'host_os == \"linux\" and host_cpu != \"arm64\" and non_git_source'")
+        require(patched != block, "DEPS gperf dep 条件与预期不符")
+        deps.write_text(text[:start] + patched + text[end if end > 0 else len(text):],
+                        encoding="utf-8")
+        print("已收窄 gperf cipd dep 条件，排除 arm64 宿主", flush=True)
 
     # ------------------------------------------------------------------
     # 阶段：deps —— Linux 宿主编译依赖（fetch 之后才有脚本本体）
