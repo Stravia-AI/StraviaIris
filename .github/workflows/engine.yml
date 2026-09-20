@@ -258,6 +258,7 @@ jobs:
           exit $code
 
       - name: 发布资产（本段编完时）
+        id: release
         if: steps.drive.outputs.exit == '0'
         shell: bash
         env:
@@ -276,7 +277,9 @@ jobs:
           gh release view "$TAG" -R "${{ github.repository }}" --json assets --jq '.assets[].name'
 
       - name: 打包工作区交棒（未编完时）
-        if: always() && steps.drive.outputs.exit != '0'
+        # drive 被跳过时其 outputs 引用会让条件假化（GitHub 表达式特性），
+        # 改用 release 步骤的 conclusion：没发布成功就要交棒。
+        if: always() && steps.release.conclusion != 'success'
         shell: bash
         run: |
           # 仅在 GN 生成后剔除 src/.git 瘦身：此前续跑需要它恢复 gclient 检出；
@@ -289,7 +292,7 @@ jobs:
             --output "$IRIS_SIB/ws.tar.zst" $exclude
 
       - name: 上传工作区工件
-        if: always() && steps.drive.outputs.exit != '0'
+        if: always() && steps.release.conclusion != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: iris-ws-${{ matrix.platform }}
