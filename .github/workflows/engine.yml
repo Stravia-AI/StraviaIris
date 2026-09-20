@@ -40,7 +40,8 @@ permissions:
   actions: write
 
 concurrency:
-  group: iris-engine-${{ github.repository }}-${{ inputs.tag || 'auto' }}
+  # 同一平台集合同一 tag 只允许一条接力链；不同平台集合可并行。
+  group: iris-engine-${{ inputs.platforms }}-${{ inputs.tag || 'auto' }}
   cancel-in-progress: false
 
 jobs:

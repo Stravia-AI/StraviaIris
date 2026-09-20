@@ -191,6 +191,12 @@ class CI:
             require(path.is_file() and path.stat().st_size, f"缺少真实补丁：{path}")
         hashes = {p.relative_to(PROJECT).as_posix(): digest(p) for p in paths}
         require(hashes == self.lock.get("patches"), "补丁输入与锁定摘要不符")
+        for relative, path in {
+            "profiles/windows-desktop.json": PROJECT / "profiles/windows-desktop.json",
+            "native/src/engine_protocol.h": PROJECT / "native/src/engine_protocol.h",
+        }.items():
+            require(path.is_file() and digest(path) == self.lock["inputs"][relative],
+                    f"构建输入与锁定摘要不符：{relative}")
         return paths, hashes
 
     def prepare_inputs(self):
