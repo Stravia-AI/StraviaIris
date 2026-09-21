@@ -695,15 +695,17 @@ index e36c344035c0006fbb9f9bc50a42281744c6fb31..d066aa39a73cae6f0faf6bb8118e46bd
  #include "third_party/blink/public/common/permissions/permission_utils.h"
  #include "third_party/blink/public/mojom/page/page.mojom-blink.h"
  #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
-@@ -276,6 +277,12 @@ void Permissions::TaskComplete(
+@@ -276,6 +277,14 @@ void Permissions::TaskComplete(
        resolver->GetExecutionContext()->IsContextDestroyed())
      return;
  
++#if BUILDFLAG(IS_WIN)
 +  // A new local-fonts query starts at prompt in the Windows reference profile.
 +  // Keep the existing listener: subsequent native permission changes still
 +  // update held PermissionStatus objects and dispatch their change events.
-+  if (BUILDFLAG(IS_WIN) && descriptor->name == PermissionName::LOCAL_FONTS)
++  if (descriptor->name == PermissionName::LOCAL_FONTS)
 +    result->status = mojom::blink::PermissionStatus::ASK;
++#endif  // BUILDFLAG(IS_WIN)
 +
    PermissionStatusListener* listener = GetOrCreatePermissionStatusListener(
        std::move(result), std::move(descriptor));

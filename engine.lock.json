@@ -53,7 +53,7 @@
     "patches/chromium/iris_020_canvas.patch": "f6165b4c486ef9dde3b4870fe9ac9788d87968fe230cc3575d917220c073afd3",
     "patches/chromium/iris_030_gpu.patch": "f9245bbec3ddc84eff0d72aa824ca1217b9baa7b60a86e42cf7f21ad2c95c0e0",
     "patches/chromium/iris_040_audio.patch": "c05724f8e6c5f881e3e71d1224dfc3aab01f26af77a6b084e1fbdbcef27dc544",
-    "patches/chromium/iris_050_fonts.patch": "cf980ac142358a0e917b287ca525bff8fc9763fab5bcd7695fb7c5a5425e9015",
+    "patches/chromium/iris_050_fonts.patch": "1e33cdc35e0f7d679883fd4a7bfe37698731bdff903d666beb1764f907c98c0a",
     "patches/chromium/iris_060_screen_timezone_webrtc.patch": "85de120f966bd75f766ca72b4d1c008a06cfd7836b71d107035996e09cb41c14",
     "patches/chromium/iris_070_engine_identity.patch": "abc19b8f9351f454c835692c82af2d15fbb1a5d7aecd88b0ee80411083b8e641",
     "patches/chromium/iris_080_linux_build.patch": "b60b5c2f100af44beaa81d39922a7bc66d7d35a5b8bcf4b4f2a949166e546e16"

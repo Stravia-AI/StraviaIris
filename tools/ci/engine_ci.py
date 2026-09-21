@@ -390,6 +390,44 @@ class CI:
             build_id + "\n", encoding="ascii")
         return build_id
 
+    def _hotfix_permissions_ask(self):
+        """iris_050 旧版本给 permissions.cc 注入运行期 BUILDFLAG(IS_WIN)
+        条件；非 Windows 上触发 -Wunreachable-code-aggressive 编译错误。
+        applied_patches 已记录该补丁的工作区不会重放，对已污染的树
+        就地改写为与新版补丁一致的 #if 形式。"""
+        path = self.src / ("third_party/blink/renderer/modules/"
+                           "permissions/permissions.cc")
+        if not path.is_file():
+            return
+        text = path.read_text(encoding="utf-8")
+        bad = ("  if (BUILDFLAG(IS_WIN) && "
+               "descriptor->name == PermissionName::LOCAL_FONTS)\n"
+               "    result->status = mojom::blink::PermissionStatus::ASK;\n")
+        good = ("#if BUILDFLAG(IS_WIN)\n"
+                "  // A new local-fonts query starts at prompt in the Windows "
+                "reference profile.\n"
+                "  // Keep the existing listener: subsequent native permission "
+                "changes still\n"
+                "  // update held PermissionStatus objects and dispatch their "
+                "change events.\n"
+                "  if (descriptor->name == PermissionName::LOCAL_FONTS)\n"
+                "    result->status = mojom::blink::PermissionStatus::ASK;\n"
+                "#endif  // BUILDFLAG(IS_WIN)\n")
+        if bad in text:
+            # 旧应用形态的注释在 if 之外；整段一起替换才与补丁结果一致。
+            old_block = ("  // A new local-fonts query starts at prompt in the "
+                         "Windows reference profile.\n"
+                         "  // Keep the existing listener: subsequent native "
+                         "permission changes still\n"
+                         "  // update held PermissionStatus objects and "
+                         "dispatch their change events.\n" + bad)
+            require(old_block in text,
+                    "permissions.cc 含旧条件但上下文与预期不符")
+            text = text.replace(old_block, good, 1)
+            path.write_text(text, encoding="utf-8")
+            print("permissions.cc 就地修复：运行期 BUILDFLAG → 预处理 #if",
+                  flush=True)
+
     def _cfg_append(self, cfg, name):
         """向 patch.cfg 的 patches 列表末尾追加条目（续跑时旧 cfg 缺新补丁）。"""
         text = cfg.read_text(encoding="utf-8")
@@ -481,6 +519,7 @@ class CI:
             save(self.state_path, self.state)
         missing = [e["name"] for e in patches if e["name"] not in applied]
         require(not missing, f"补丁队列未全部就位：{missing}")
+        self._hotfix_permissions_ask()
         build_id = self.prepare_inputs()
         self.save_state("gen", applied=True, patches=hashes, engine_build_id=build_id)
 
