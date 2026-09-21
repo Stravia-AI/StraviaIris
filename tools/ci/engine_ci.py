@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import platform as host_platform
 import re
 import shutil
 import signal
@@ -162,9 +163,44 @@ class CI:
         self.run([self.root / "depot_tools/vpython3.bat",
                   self.root / "depot_tools/gsutil.py", "version"])
 
+    def workspace_arch(self):
+        """识别接力工作区构建时的宿主架构；无法判断返回 None。
+
+        优先读 fetch 写下的 .iris-arch 标记；无标记（旧归档）时探测
+        buildtools 里 cipd 下发的 gn ELF 机型码——同一 dep 路径在
+        arm64 宿主上是 aarch64 二进制、x64 宿主上是 x86-64。"""
+        marker = self.root / ".iris-arch"
+        if marker.is_file():
+            return marker.read_text(encoding="utf-8").strip() or None
+        probe = self.src / "buildtools/linux64/gn"
+        if not IS_WINDOWS and probe.is_file():
+            header = probe.read_bytes()[:20]
+            if header[:4] == b"\x7fELF":
+                return {0x3E: "x86_64", 0xB7: "aarch64"}.get(
+                    int.from_bytes(header[18:20], "little"))
+        return None
+
+    def purge_foreign_arch(self):
+        """异构宿主导出的工作区（linux-arm64 曾跑 arm64 runner）里
+        depot_tools/buildtools 的 cipd 二进制无法跨架构执行；逐目录
+        修补不如整体重拉。标记缺失且探测不出时保守保留，交给下游
+        完整性检查兜底。"""
+        arch = self.workspace_arch()
+        host = host_platform.machine()
+        if not arch or arch == host:
+            return
+        print(f"接力工作区为 {arch} 宿主产物（当前 {host}）；清空重建。",
+              flush=True)
+        for child in ("chromium", "cef", "depot_tools"):
+            shutil.rmtree(self.root / child, ignore_errors=True)
+        (self.root / ".iris-arch").unlink(missing_ok=True)
+        self.state.clear()
+        save(self.state_path, self.state)
+
     def fetch(self):
         depot = self.lock["depot_tools"]
         self.root.mkdir(parents=True, exist_ok=True)
+        self.purge_foreign_arch()
         if not (self.root / "depot_tools/.git").exists():
             self.run(["git", "clone", "--no-checkout", depot["url"], self.root / "depot_tools"])
         self.run(["git", "-C", self.root / "depot_tools", "checkout", "--detach", depot["commit"]])
@@ -272,6 +308,8 @@ class CI:
             self.run(["gclient.bat" if IS_WINDOWS else "gclient",
                              "runhooks"], cwd=chromium)
         self.revisions()
+        (self.root / ".iris-arch").write_text(host_platform.machine(),
+                                              encoding="utf-8")
         self.save_state("apply", fetched=True, hooks_done=True)
 
     def patch_deps_gperf(self):
