@@ -591,7 +591,12 @@ class CI:
             with ninja_file.open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     if line.startswith("build "):
+                        # 根目录产物边常写作 build ./cefsimple:，可执行文件边则是
+                        # build cefsimple.exe:；先归一化再比对，避免漏配 cefsimple。
                         name = line[6:].split(":", 1)[0].strip()
+                        name = name.removeprefix("./")
+                        if name.endswith(".exe"):
+                            name = name[:-4]
                         if name in self.lock["build_targets"]:
                             available.add(name)
         targets = [t for t in self.lock["build_targets"] if t in available]
@@ -601,7 +606,12 @@ class CI:
 
     def build(self, deadline):
         ninja_cmd = "autoninja.bat" if IS_WINDOWS else "autoninja"
-        targets = self.state.get("ninja_targets") or self.build_targets()
+        # 与已持久化目标取并集：早期分段只记了 libcef，续跑须补回 cefsimple。
+        seen = self.build_targets()
+        targets = [t for t in self.lock["build_targets"]
+                   if t in set(seen) | set(self.state.get("ninja_targets") or ())]
+        if "libcef" not in targets:
+            targets.insert(0, "libcef")
         self.state["ninja_targets"] = targets
         code = self.run_deadline([self.root / "depot_tools" / ninja_cmd,
                                   "-C", f"out/{self.config}", *targets],
@@ -613,6 +623,16 @@ class CI:
         lib = self.out / self.pcfg["lib"]
         simple = self.out / ("cefsimple" + self.pcfg["exe"])
         require(lib.is_file(), f"构建缺少产物：{lib}")
+        if not simple.is_file():
+            # cefsimple 的 ninja 边可能未进入目标列表（名称形态差异）；
+            # 交由 ninja 按输出路径自行解析，仍缺产物才视为失败。
+            code = self.run_deadline([self.root / "depot_tools" / ninja_cmd,
+                                      "-C", f"out/{self.config}", "cefsimple"],
+                                     cwd=self.src, deadline=deadline)
+            if code == "deadline":
+                self.save_state("build", last_result="deadline")
+                return False
+            require(code == 0, f"cefsimple 编译失败：exit={code}")
         require(simple.is_file(), f"构建缺少产物：{simple}")
         binaries = {}
         for pattern in (self.pcfg["lib"], "cefsimple" + self.pcfg["exe"],
