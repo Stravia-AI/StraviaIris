@@ -605,7 +605,15 @@ class CI:
         return targets
 
     def build(self, deadline):
-        ninja_cmd = "autoninja.bat" if IS_WINDOWS else "autoninja"
+        # 分段接力必须走 ninja 而非 autoninja（后者默认调度 siso）：siso 的
+        # .siso_fs_state 只在干净退出时落盘，硬截止 SIGKILL 后整段编译进度
+        # 无记录，每跳全量重跑、永不收敛；ninja 的 .ninja_log 逐边追加，
+        # 被杀后已完成边仍算完成，跨跳收敛。
+        # depot_tools/ninja.py 拒绝在含 .siso_deps 的输出目录运行，
+        # 清掉 siso 遗留状态后直连 third_party/ninja。
+        for marker in self.out.glob(".siso_*"):
+            marker.unlink(missing_ok=True)
+        ninja_cmd = "ninja.bat" if IS_WINDOWS else "ninja"
         # 与已持久化目标取并集：早期分段只记了 libcef，续跑须补回 cefsimple。
         seen = self.build_targets()
         targets = [t for t in self.lock["build_targets"]
