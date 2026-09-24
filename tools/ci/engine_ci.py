@@ -428,6 +428,48 @@ class CI:
             print("permissions.cc 就地修复：运行期 BUILDFLAG → 预处理 #if",
                   flush=True)
 
+    def _hotfix_timezone_shadow(self):
+        """iris 补丁旧版本在 chrome_main_delegate_cef.cc 与 profile.cc/.h
+        使用裸标识符 timezone——glibc time.h 暴露同名全局变量，Linux 上
+        -Werror -Wshadow 编译失败。已应用旧补丁的工作区不会重放补丁，
+        就地改名为与新版补丁一致的 iris_timezone / timezone_id。"""
+        delegate = (self.src /
+                    "cef/libcef/common/chrome/chrome_main_delegate_cef.cc")
+        if delegate.is_file():
+            text = delegate.read_text(encoding="utf-8")
+            if "const auto& timezone = iris::GetRuntimeConfig().timezone;" in text:
+                text = text.replace(
+                    "const auto& timezone = iris::GetRuntimeConfig().timezone;",
+                    "const auto& iris_timezone = "
+                    "iris::GetRuntimeConfig().timezone;")
+                text = text.replace("if (!timezone.empty()) {",
+                                    "if (!iris_timezone.empty()) {")
+                text = text.replace("fromUTF8(timezone)",
+                                    "fromUTF8(iris_timezone)")
+                delegate.write_text(text, encoding="utf-8")
+                print("chrome_main_delegate_cef.cc 就地修复：局部变量 "
+                      "timezone → iris_timezone", flush=True)
+        for relative in ("components/iris/profile.cc",
+                         "components/iris/profile.h"):
+            path = self.src / relative
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "std::string_view timezone" not in text:
+                continue
+            text = text.replace(
+                "std::string_view seed, std::string_view timezone",
+                "std::string_view seed, std::string_view timezone_id")
+            text = text.replace("timezone.find('\\0')",
+                                "timezone_id.find('\\0')")
+            text = text.replace("IsStringUTF8(timezone)",
+                                "IsStringUTF8(timezone_id)")
+            text = text.replace("std::string(timezone)",
+                                "std::string(timezone_id)")
+            path.write_text(text, encoding="utf-8")
+            print(f"{relative} 就地修复：形参 timezone → timezone_id",
+                  flush=True)
+
     def _cfg_append(self, cfg, name):
         """向 patch.cfg 的 patches 列表末尾追加条目（续跑时旧 cfg 缺新补丁）。"""
         text = cfg.read_text(encoding="utf-8")
@@ -520,6 +562,7 @@ class CI:
         missing = [e["name"] for e in patches if e["name"] not in applied]
         require(not missing, f"补丁队列未全部就位：{missing}")
         self._hotfix_permissions_ask()
+        self._hotfix_timezone_shadow()
         build_id = self.prepare_inputs()
         self.save_state("gen", applied=True, patches=hashes, engine_build_id=build_id)
 

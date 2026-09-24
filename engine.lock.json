@@ -48,13 +48,13 @@
   },
   "patches": {
     "patches/cef/0001-register-iris.patch": "509d024684902d5ac6f9a03516d2e4b921c6bf06d1f2a9eebb2951fb9bb63b6a",
-    "patches/chromium/iris_000_profile.patch": "81dad9fbaf249cb747711af974473598736470b2d7d471f84bb60931c7045fd9",
+    "patches/chromium/iris_000_profile.patch": "6338cdda51068dd897d4a0d239523aa495f69a99eeed89fb36f0162dd2307876",
     "patches/chromium/iris_010_identity.patch": "4164d0a2031c138fad599007c81a54ff0276fa76c655ada81660238855999da5",
     "patches/chromium/iris_020_canvas.patch": "f6165b4c486ef9dde3b4870fe9ac9788d87968fe230cc3575d917220c073afd3",
     "patches/chromium/iris_030_gpu.patch": "f9245bbec3ddc84eff0d72aa824ca1217b9baa7b60a86e42cf7f21ad2c95c0e0",
     "patches/chromium/iris_040_audio.patch": "c05724f8e6c5f881e3e71d1224dfc3aab01f26af77a6b084e1fbdbcef27dc544",
     "patches/chromium/iris_050_fonts.patch": "1e33cdc35e0f7d679883fd4a7bfe37698731bdff903d666beb1764f907c98c0a",
-    "patches/chromium/iris_060_screen_timezone_webrtc.patch": "85de120f966bd75f766ca72b4d1c008a06cfd7836b71d107035996e09cb41c14",
+    "patches/chromium/iris_060_screen_timezone_webrtc.patch": "a0dbc8d4835ab77c2edd566835beaa38e56820fc5ac5117af0956970020c66f7",
     "patches/chromium/iris_070_engine_identity.patch": "abc19b8f9351f454c835692c82af2d15fbb1a5d7aecd88b0ee80411083b8e641",
     "patches/chromium/iris_080_linux_build.patch": "b60b5c2f100af44beaa81d39922a7bc66d7d35a5b8bcf4b4f2a949166e546e16"
   },

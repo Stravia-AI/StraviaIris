@@ -153,18 +153,19 @@ index cc28f6fd9232be3ad15c0d684bc114e209d0c228..806b4e5fbdcdc743efc80c6f028fba4e
    // Call as early as possible.
    InitLogging(command_line);
  
-@@ -532,7 +556,27 @@ std::variant<int, content::MainFunctionParams>
+@@ -532,7 +556,28 @@ std::variant<int, content::MainFunctionParams>
  ChromeMainDelegateCef::RunProcess(
      const std::string& process_type,
      content::MainFunctionParams main_function_params) {
 +  // BasicStartupComplete 时 ICU 尚未初始化；在所有进程的实际入口前校验，
 +  // 不把未知 ID 静默映射到 GMT。这里只校验，不修改宿主系统时区。
-+  const auto& timezone = iris::GetRuntimeConfig().timezone;
-+  if (!timezone.empty()) {
++  // 命名 iris_timezone：glibc time.h 暴露全局 timezone，原名触发 -Wshadow。
++  const auto& iris_timezone = iris::GetRuntimeConfig().timezone;
++  if (!iris_timezone.empty()) {
 +    UErrorCode error = U_ZERO_ERROR;
 +    UBool is_system_id = false;
 +    icu::UnicodeString canonical;
-+    icu::TimeZone::getCanonicalID(icu::UnicodeString::fromUTF8(timezone),
++    icu::TimeZone::getCanonicalID(icu::UnicodeString::fromUTF8(iris_timezone),
 +                                canonical, is_system_id, error);
 +    if (U_FAILURE(error) || !is_system_id) {
 +      return iris_engine::kInvalidArgumentExit;

@@ -557,7 +557,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..105940f899ee478ee58294369581acaacd8b6f2f
 --- /dev/null
 +++ components/iris/profile.cc
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +// Copyright 2026 StraviaIris contributors
 +// SPDX-License-Identifier: BSD-3-Clause
 +
@@ -603,10 +603,11 @@ index 0000000000000000000000000000000000000000..105940f899ee478ee58294369581acaa
 +
 +}  // namespace
 +
-+bool InitializeProcess(std::string_view seed, std::string_view timezone) {
++// 形参命名 timezone_id：glibc time.h 暴露全局 timezone，原名触发 -Wshadow。
++bool InitializeProcess(std::string_view seed, std::string_view timezone_id) {
 +  if (g_runtime_config || seed.empty() ||
-+      timezone.find('\0') != std::string_view::npos ||
-+      !base::IsStringUTF8(timezone)) {
++      timezone_id.find('\0') != std::string_view::npos ||
++      !base::IsStringUTF8(timezone_id)) {
 +    return false;
 +  }
 +  uint64_t parsed_seed = 0;
@@ -617,7 +618,7 @@ index 0000000000000000000000000000000000000000..105940f899ee478ee58294369581acaa
 +  }
 +  static const base::NoDestructor<RuntimeConfig> config(parsed_seed,
 +                                                        CanvasSeed(parsed_seed),
-+                                                        std::string(timezone));
++                                                        std::string(timezone_id));
 +  g_runtime_config = config.get();
 +  return true;
 +}
@@ -661,7 +662,7 @@ index 0000000000000000000000000000000000000000..47b33529676087a4dee14fb9e5546708
 +// 仅供进程启动主线程调用，须先于 renderer/worker/GPU 工作线程。
 +// 十进制 seed 必须完整且不溢出；0 合法。重复初始化失败，不改变既有配置。
 +// timezone 的 ICU 校验由 ICU 初始化后的原有启动层完成。
-+bool InitializeProcess(std::string_view seed, std::string_view timezone);
++bool InitializeProcess(std::string_view seed, std::string_view timezone_id);
 +
 +// 成功 InitializeProcess 后才可访问；返回值在进程退出前不可变且保持有效。
 +const RuntimeConfig& GetRuntimeConfig();
